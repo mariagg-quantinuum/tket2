@@ -24,7 +24,7 @@ path = "src/lib.rs"
 [features]
 # Enables search and replace optimisation passes using the `portmatching` crate.
 portmatching = ["dep:portmatching", "dep:rmp-serde"]
-badgerv2_unstable = ["hugr/persistent_unstable", "chrono/serde", "dep:z3"]
+badgerv2_unstable = ["hugr/persistent_unstable", "chrono/serde", "dep:z3", "z3/gh-release" ]
 
 # Stores a trace of the applied rewrites
 rewrite-tracing = []
