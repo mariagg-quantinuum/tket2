@@ -2,10 +2,9 @@
 
 use std::thread::{self, JoinHandle};
 
-use crate::circuit::cost::CircuitCost;
 use crate::circuit::CircuitHash;
 use crate::optimiser::badger::{BadgerRewriteStrategy, BadgerRewriter};
-use crate::resource::ResourceScope;
+use crate::{circuit::cost::CircuitCost, resource::ResourceScope};
 
 use super::pqueue_worker::{StatePQueueChannels, Work};
 

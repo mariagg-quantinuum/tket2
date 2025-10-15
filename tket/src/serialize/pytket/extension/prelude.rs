@@ -1,13 +1,11 @@
 //! Encoder and decoder for tket operations with native pytket counterparts.
 
-use std::sync::Arc;
-
 use super::PytketEmitter;
 use crate::serialize::pytket::config::TypeTranslatorSet;
 use crate::serialize::pytket::decoder::{
     DecodeStatus, LoadedParameter, PytketDecoderContext, TrackedBit, TrackedQubit,
 };
-use crate::serialize::pytket::encoder::{EncodeStatus, PytketEncoderContext};
+use crate::serialize::pytket::encoder::{EmitCommandOptions, EncodeStatus, PytketEncoderContext};
 use crate::serialize::pytket::extension::{PytketDecoder, PytketTypeTranslator, RegisterCount};
 use crate::serialize::pytket::{PytketDecodeError, PytketEncodeError};
 use crate::Circuit;
@@ -39,7 +37,12 @@ impl<H: HugrView> PytketEmitter<H> for PreludeEmitter {
             return self.tuple_op_to_pytket(node, op, &tuple_op, circ, encoder);
         };
         if let Ok(_barrier) = BarrierDef::from_extension_op(op) {
-            encoder.emit_node(PytketOptype::Barrier, node, circ)?;
+            encoder.emit_node(
+                PytketOptype::Barrier,
+                node,
+                circ,
+                EmitCommandOptions::new().reuse_all_bits(),
+            )?;
             return Ok(EncodeStatus::Success);
         };
         Ok(EncodeStatus::Unsupported)
@@ -120,7 +123,7 @@ impl PytketDecoder for PreludeEmitter {
         op: &tket_json_rs::circuit_json::Operation,
         qubits: &[TrackedQubit],
         bits: &[TrackedBit],
-        params: &[Arc<LoadedParameter>],
+        params: &[LoadedParameter],
         opgroup: Option<&str>,
         decoder: &mut PytketDecoderContext<'h>,
     ) -> Result<DecodeStatus, PytketDecodeError> {
@@ -144,7 +147,7 @@ impl PytketDecoder for PreludeEmitter {
         if !params.is_empty() {
             return Ok(DecodeStatus::Unsupported);
         }
-        decoder.add_node_with_wires(op, qubits, bits, &[])?;
+        decoder.add_node_with_wires(op, qubits, qubits, bits, &[], &[])?;
 
         Ok(DecodeStatus::Success)
     }

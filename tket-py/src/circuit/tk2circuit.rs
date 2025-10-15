@@ -18,8 +18,8 @@ use itertools::Itertools;
 use pyo3::exceptions::{PyAttributeError, PyValueError};
 use pyo3::types::{PyAnyMethods, PyModule, PyString, PyTypeMethods};
 use pyo3::{
-    pyclass, pymethods, Bound, FromPyObject, IntoPyObject, PyAny, PyErr, PyObject, PyRef, PyRefMut,
-    PyResult, PyTypeInfo, Python,
+    pyclass, pymethods, Bound, FromPyObject, IntoPyObject, PyAny, PyErr, PyRef, PyRefMut, PyResult,
+    PyTypeInfo, Python,
 };
 
 use derive_more::From;
@@ -28,6 +28,7 @@ use serde::Serialize;
 use tket::circuit::CircuitHash;
 use tket::passes::pytket::lower_to_pytket;
 use tket::passes::CircuitChunks;
+use tket::serialize::pytket::{DecodeOptions, EncodeOptions};
 use tket::serialize::TKETDecode;
 use tket::{Circuit, TketOp};
 use tket_json_rs::circuit_json::SerialCircuit;
@@ -82,9 +83,12 @@ impl Tk2Circuit {
     /// Convert the [`Tk2Circuit`] to a tket1 circuit.
     pub fn to_tket1<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let circ = lower_to_pytket(&self.circ).convert_pyerrs()?;
-        SerialCircuit::encode_with_config(&circ, tket_qsystem::pytket::qsystem_encoder_config())
-            .convert_pyerrs()?
-            .to_tket1(py)
+        SerialCircuit::encode(
+            &circ,
+            EncodeOptions::new().with_config(tket_qsystem::pytket::qsystem_encoder_config()),
+        )
+        .convert_pyerrs()?
+        .to_tket1(py)
     }
 
     /// Apply a rewrite on the circuit.
@@ -157,9 +161,9 @@ impl Tk2Circuit {
         // Try to simplify tuple pack-unpack pairs, and other operations not supported by pytket.
         let circ = lower_to_pytket(&self.circ).convert_pyerrs()?;
         serde_json::to_string(
-            &SerialCircuit::encode_with_config(
+            &SerialCircuit::encode(
                 &circ,
-                tket_qsystem::pytket::qsystem_encoder_config(),
+                EncodeOptions::new().with_config(tket_qsystem::pytket::qsystem_encoder_config()),
             )
             .convert_pyerrs()?,
         )
@@ -173,7 +177,7 @@ impl Tk2Circuit {
     pub fn from_tket1_json(json: &str) -> PyResult<Self> {
         let circ = tket::serialize::load_tk1_json_str(
             json,
-            Some(tket_qsystem::pytket::qsystem_decoder_config()),
+            DecodeOptions::new().with_config(tket_qsystem::pytket::qsystem_decoder_config()),
         )
         .map_err(|e| {
             PyErr::new::<PyAttributeError, _>(format!("Could not load pytket circuit: {e}"))
@@ -186,9 +190,9 @@ impl Tk2Circuit {
         // Try to simplify tuple pack-unpack pairs, and other operations not supported by pytket.
         let circ = lower_to_pytket(&self.circ).convert_pyerrs()?;
         serde_json::to_vec(
-            &SerialCircuit::encode_with_config(
+            &SerialCircuit::encode(
                 &circ,
-                tket_qsystem::pytket::qsystem_encoder_config(),
+                EncodeOptions::new().with_config(tket_qsystem::pytket::qsystem_encoder_config()),
             )
             .convert_pyerrs()?,
         )
@@ -202,7 +206,7 @@ impl Tk2Circuit {
     pub fn from_tket1_json_bytes(json: &[u8]) -> PyResult<Self> {
         let circ = tket::serialize::load_tk1_json_reader(
             json,
-            Some(tket_qsystem::pytket::qsystem_decoder_config()),
+            DecodeOptions::new().with_config(tket_qsystem::pytket::qsystem_decoder_config()),
         )
         .map_err(|e| {
             PyErr::new::<PyAttributeError, _>(format!("Could not load pytket circuit: {e}"))

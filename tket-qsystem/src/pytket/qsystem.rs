@@ -1,7 +1,5 @@
 //! Encoder/decoder for [qsystem::EXTENSION][use crate::extension::qsystem::EXTENSION] operations.
 
-use std::sync::Arc;
-
 use hugr::extension::simple_op::MakeExtensionOp;
 use hugr::extension::ExtensionId;
 use hugr::ops::ExtensionOp;
@@ -10,7 +8,7 @@ use itertools::Itertools as _;
 use tket::serialize::pytket::decoder::{
     DecodeStatus, LoadedParameter, ParameterType, PytketDecoderContext, TrackedBit, TrackedQubit,
 };
-use tket::serialize::pytket::encoder::{make_tk1_operation, EncodeStatus};
+use tket::serialize::pytket::encoder::{make_tk1_operation, EmitCommandOptions, EncodeStatus};
 use tket::serialize::pytket::extension::PytketDecoder;
 use tket::serialize::pytket::{
     PytketDecodeError, PytketEmitter, PytketEncodeError, PytketEncoderContext,
@@ -86,20 +84,15 @@ impl QSystemEmitter {
 
         // pytket parameters are always in half-turns.
         // Since the `tket.qsystem` op inputs are in radians, we have to convert them here.
-        encoder.emit_node_command(
-            node,
-            circ,
-            |_| Vec::new(),
-            move |mut inputs| {
-                for param in inputs.params.to_mut() {
-                    *param = match param.strip_suffix(") * (pi)") {
-                        Some(s) if s.starts_with("(") => s[1..].to_string(),
-                        _ => format!("{param} / (pi)"),
-                    };
-                }
-                make_tk1_operation(serial_op, inputs)
-            },
-        )?;
+        encoder.emit_node_command(node, circ, EmitCommandOptions::new(), move |mut inputs| {
+            for param in inputs.params.to_mut() {
+                *param = match param.strip_suffix(") * (pi)") {
+                    Some(s) if s.starts_with("(") => s[1..].to_string(),
+                    _ => format!("{param} / (pi)"),
+                };
+            }
+            make_tk1_operation(serial_op, inputs)
+        })?;
 
         Ok(EncodeStatus::Success)
     }
@@ -111,7 +104,12 @@ impl QSystemEmitter {
         circ: &Circuit<H>,
         encoder: &mut PytketEncoderContext<H>,
     ) -> Result<EncodeStatus, PytketEncodeError<H::Node>> {
-        encoder.emit_node(PytketOptype::Barrier, node, circ)?;
+        encoder.emit_node(
+            PytketOptype::Barrier,
+            node,
+            circ,
+            EmitCommandOptions::new().reuse_all_bits(),
+        )?;
 
         Ok(EncodeStatus::Success)
     }
@@ -132,7 +130,7 @@ impl PytketDecoder for QSystemEmitter {
         op: &tket_json_rs::circuit_json::Operation,
         qubits: &[TrackedQubit],
         bits: &[TrackedBit],
-        params: &[Arc<LoadedParameter>],
+        params: &[LoadedParameter],
         _opgroup: Option<&str>,
         decoder: &mut PytketDecoderContext<'h>,
     ) -> Result<DecodeStatus, PytketDecodeError> {
@@ -141,9 +139,15 @@ impl PytketDecoder for QSystemEmitter {
             PytketOptype::ZZPhase => QSystemOp::ZZPhase,
             PytketOptype::ZZMax => {
                 // This is a ZZPhase with a 1/2 angle.
-                let param =
-                    Arc::new(decoder.load_parameter_with_type("pi/2", ParameterType::FloatRadians));
-                decoder.add_node_with_wires(QSystemOp::ZZPhase, qubits, bits, &[param])?;
+                let param = decoder.load_half_turns_with_type("0.5", ParameterType::FloatRadians);
+                decoder.add_node_with_wires(
+                    QSystemOp::ZZPhase,
+                    qubits,
+                    qubits,
+                    bits,
+                    &[],
+                    &[param],
+                )?;
                 return Ok(DecodeStatus::Success);
             }
             _ => {
@@ -154,10 +158,10 @@ impl PytketDecoder for QSystemEmitter {
         // We expect all parameters to be floats in radians.
         let params = params
             .iter()
-            .map(|p| Arc::new(p.as_float_radians(&mut decoder.builder)))
+            .map(|p| p.as_float_radians(&mut decoder.builder))
             .collect_vec();
 
-        decoder.add_node_with_wires(op, qubits, bits, &params)?;
+        decoder.add_node_with_wires(op, qubits, qubits, bits, &[], &params)?;
 
         Ok(DecodeStatus::Success)
     }

@@ -1,7 +1,5 @@
 //! Encoder and decoder for the tket.bool extension
 
-use std::sync::Arc;
-
 use super::PytketEmitter;
 use crate::extension::bool::{BoolOp, ConstBool, BOOL_EXTENSION_ID, BOOL_TYPE_NAME};
 use crate::serialize::pytket::config::TypeTranslatorSet;
@@ -9,7 +7,7 @@ use crate::serialize::pytket::decoder::{
     DecodeStatus, LoadedParameter, PytketDecoderContext, TrackedBit, TrackedQubit,
 };
 use crate::serialize::pytket::encoder::{
-    make_tk1_classical_expression, make_tk1_classical_operation, EncodeStatus,
+    make_tk1_classical_expression, make_tk1_classical_operation, EmitCommandOptions, EncodeStatus,
     PytketEncoderContext, TrackedValues,
 };
 use crate::serialize::pytket::extension::{PytketDecoder, PytketTypeTranslator, RegisterCount};
@@ -70,7 +68,7 @@ impl<H: HugrView> PytketEmitter<H> for BoolEmitter {
             .collect_vec();
 
         let op = make_tk1_classical_expression(bit_count, &output_bits, &[], expression);
-        encoder.emit_node_command(node, circ, |_args| Vec::new(), move |_| op)?;
+        encoder.emit_node_command(node, circ, EmitCommandOptions::new(), move |_| op)?;
         Ok(EncodeStatus::Success)
     }
 
@@ -121,7 +119,7 @@ impl PytketDecoder for BoolEmitter {
         op: &tket_json_rs::circuit_json::Operation,
         qubits: &[TrackedQubit],
         bits: &[TrackedBit],
-        params: &[Arc<LoadedParameter>],
+        params: &[LoadedParameter],
         _opgroup: Option<&str>,
         decoder: &mut PytketDecoderContext<'h>,
     ) -> Result<DecodeStatus, PytketDecodeError> {
@@ -154,12 +152,12 @@ impl PytketDecoder for BoolEmitter {
             }
         }
 
-        let op = match clexpr.expr.op {
-            ClOp::BitEq => BoolOp::eq,
-            ClOp::BitNot => BoolOp::not,
-            ClOp::BitAnd => BoolOp::and,
-            ClOp::BitOr => BoolOp::or,
-            ClOp::BitXor => BoolOp::xor,
+        let (op, num_inputs) = match clexpr.expr.op {
+            ClOp::BitEq => (BoolOp::eq, 2),
+            ClOp::BitNot => (BoolOp::not, 1),
+            ClOp::BitAnd => (BoolOp::and, 2),
+            ClOp::BitOr => (BoolOp::or, 2),
+            ClOp::BitXor => (BoolOp::xor, 2),
             _ => return Ok(DecodeStatus::Unsupported),
         };
 
@@ -167,7 +165,14 @@ impl PytketDecoder for BoolEmitter {
             return Ok(DecodeStatus::Unsupported);
         }
 
-        decoder.add_node_with_wires(op, qubits, bits, &[])?;
+        decoder.add_node_with_wires(
+            op,
+            qubits,
+            qubits,
+            &bits[..num_inputs],
+            &bits[num_inputs..],
+            &[],
+        )?;
 
         Ok(DecodeStatus::Success)
     }

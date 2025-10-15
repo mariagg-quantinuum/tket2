@@ -27,3 +27,14 @@ lcov.info
 .envrc
 
 .DS_Store
+
+# Python sphinx docs
+tket-py/docs/build
+tket-py/docs/generated
+jupyter_execute/
+
+.github/copilot-instructions.md
+
+
+# binaries
+*.so

@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use derive_more::derive::{Display, Error};
 use hugr::{
     core::HugrNode,
-    hugr::{patch::simple_replace, views::SiblingSubgraph, Patch},
-    ops::OpTrait,
+    hugr::{
+        patch::simple_replace,
+        views::{sibling_subgraph::InvalidSubgraph, SiblingSubgraph},
+        Patch,
+    },
     Direction, HugrView, OutgoingPort, Port, PortIndex, SimpleReplacement,
 };
 use indexmap::IndexMap;
@@ -33,10 +36,10 @@ where
         match self {
             CircuitRewrite::New(rewrite) => rewrite.apply(h),
             CircuitRewrite::Old(..) => {
-                let mut rw = self.clone();
-                rw.ensure_new(h)
-                    .expect("could not convert to new rewrite format");
-                rw.apply(h)
+                let rw = self.clone();
+                rw.into_new(h)
+                    .expect("could not convert to new rewrite format")
+                    .apply(h)
             }
         }
     }
@@ -160,14 +163,11 @@ mod badgerv2_unstable {
         /// would need ResourceScope: HugrView.
         pub fn apply_rewrite_persistent(
             &mut self,
-            mut rewrite: CircuitRewrite<PatchNode>,
+            rewrite: CircuitRewrite<PatchNode>,
         ) -> Result<CommitId, CircuitRewriteError> {
-            rewrite
-                .ensure_new(self)
+            let rewrite = rewrite
+                .into_new(self)
                 .map_err(CircuitRewriteError::new_simple_replacement_error)?;
-            let CircuitRewrite::New(rewrite) = rewrite else {
-                panic!("ensure_new did not convert to new rewrite format");
-            };
             self.apply_rewrite_new_persistent(rewrite)
         }
 
@@ -213,14 +213,10 @@ mod badgerv2_unstable {
         repl: SimpleReplacement<PatchNode>,
         scope: &ResourceScope<PersistentHugr>,
     ) -> Result<NewCircuitRewrite<PatchNode>, CircuitRewriteError> {
-        let mut rewrite: CircuitRewrite<_> = OldCircuitRewrite(repl).into();
+        let rewrite: CircuitRewrite<_> = OldCircuitRewrite(repl).into();
         rewrite
-            .ensure_new(scope)
-            .map_err(CircuitRewriteError::new_simple_replacement_error)?;
-        let CircuitRewrite::New(rw) = rewrite else {
-            panic!("just converted to new rewrite kind");
-        };
-        Ok(rw)
+            .into_new(scope)
+            .map_err(CircuitRewriteError::new_simple_replacement_error)
     }
 }
 
@@ -258,7 +254,8 @@ impl<H: HugrView> ResourceScope<H> {
     ) {
         let new_node_set = self
             .subgraph()
-            .nodes()
+            .map(|subgraph| subgraph.nodes())
+            .unwrap_or_default()
             .iter()
             .copied()
             .chain(new_nodes)
@@ -280,9 +277,12 @@ impl<H: HugrView> ResourceScope<H> {
             .map(|(n, p)| self.hugr().single_linked_output(n, p))
             .while_some()
             .collect_vec();
-
-        self.subgraph =
-            SiblingSubgraph::new_unchecked(incoming_ports, outgoing_ports, vec![], new_node_set);
+        self.subgraph = Some(SiblingSubgraph::new_unchecked(
+            incoming_ports,
+            outgoing_ports,
+            vec![],
+            new_node_set,
+        ));
     }
 
     fn get_nearest_position<P: Into<Port>>(
@@ -318,9 +318,13 @@ impl<H: Clone + HugrView<Node = hugr::Node>> ResourceScope<H> {
                     .collect_vec()
             })
             .collect_vec();
-        let subgraph = circuit
-            .try_to_subgraph()
-            .unwrap_or_else(|e| panic!("Invalid subgraph: {e}"));
+        let subgraph = match circuit.subgraph() {
+            Ok(subgraph) => Some(subgraph),
+            Err(InvalidSubgraph::EmptySubgraph) => None,
+            Err(e) => {
+                panic!("Invalid subgraph: {e}");
+            }
+        };
 
         let mut this = Self {
             hugr: circuit.into_hugr(),
@@ -330,7 +334,14 @@ impl<H: Clone + HugrView<Node = hugr::Node>> ResourceScope<H> {
 
         for (inp, unit) in inputs.into_iter().zip_eq(units) {
             for (node, port) in inp {
-                let node_units = node_circuit_units_mut(&mut this.circuit_units, node, &this.hugr);
+                if !this.subgraph_nodes().contains(&node) {
+                    continue;
+                }
+                let Some(node_units) =
+                    node_circuit_units_mut(&mut this.circuit_units, node, &this.hugr)
+                else {
+                    continue;
+                };
                 node_units.port_map.set(port, unit)
             }
         }
@@ -353,11 +364,17 @@ impl<H: Clone + HugrView<Node = hugr::Node>> ResourceScope<H> {
 
         debug_assert!(curr_start < curr_end || (curr_start == curr_end && self.nodes().len() == 1));
 
-        for &node in self.subgraph.nodes() {
-            if self.hugr.get_optype(node).dataflow_signature().is_none() {
+        for &node in self
+            .subgraph
+            .as_ref()
+            .map(|subgraph| subgraph.nodes())
+            .unwrap_or_default()
+        {
+            let Some(node_units) =
+                node_circuit_units_mut(&mut self.circuit_units, node, &self.hugr)
+            else {
                 continue;
-            }
-            let node_units = node_circuit_units_mut(&mut self.circuit_units, node, &self.hugr);
+            };
             node_units.position = node_units
                 .position
                 .rescale(curr_start..=curr_end, start..=end);
@@ -391,23 +408,27 @@ impl<N: HugrNode> NewCircuitRewrite<N> {
 
         debug_assert_eq!(inputs.len(), replacement.circuit_signature().input_count());
 
-        let units_at_inputs = inputs.iter().enumerate().map(|(i, inp)| {
-            debug_assert!(inp
-                .iter()
-                .map(|&(node, port)| circuit.get_circuit_unit(node, port))
-                .all_equal());
-            debug_assert!(!inp.is_empty());
+        let units_at_inputs = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, inp)| {
+                debug_assert!(inp
+                    .iter()
+                    .map(|&(node, port)| circuit.get_circuit_unit(node, port))
+                    .all_equal());
+                debug_assert!(!inp.is_empty());
 
-            let &(node, port) = inp.first().expect("just checked");
-            circuit
-                .get_circuit_unit(node, port)
-                .expect("just checked")
-                .map_node_port(|u, p| {
-                    let repl_inp_port = (replacement.input_node(), OutgoingPort::from(i));
-                    input_remap.insert(repl_inp_port, (u, p));
-                    repl_inp_port
-                })
-        });
+                let &(node, port) = inp.first().expect("just checked");
+                circuit
+                    .get_circuit_unit(node, port)
+                    .expect("just checked")
+                    .map_node_port(|u, p| {
+                        let repl_inp_port = (replacement.input_node(), OutgoingPort::from(i));
+                        input_remap.insert(repl_inp_port, (u, p));
+                        repl_inp_port
+                    })
+            })
+            .collect_vec();
         let units_at_outputs = outputs.iter().map(|&(node, port)| {
             circuit
                 .get_circuit_unit(node, port)
@@ -419,19 +440,23 @@ impl<N: HugrNode> NewCircuitRewrite<N> {
         if replacement.num_operations() > 0 {
             let repl_scope = repl_scope.insert(ResourceScope::from_circuit_with_input_units(
                 replacement.clone(),
-                units_at_inputs,
+                units_at_inputs.iter().cloned(),
             ));
 
-            let effective_units_at_outputs =
-                repl_scope
-                    .subgraph()
-                    .outgoing_ports()
-                    .iter()
-                    .map(|&(node, port)| {
-                        repl_scope
-                            .get_circuit_unit(node, port)
-                            .expect("output must exist")
-                    });
+            let io_nodes = repl_scope.as_circuit().io_nodes();
+            let effective_units_at_outputs = repl_scope
+                .hugr()
+                .all_linked_outputs(io_nodes[1])
+                .filter_map(|(out_node, out_port)| {
+                    if let Some(unit) = repl_scope.get_circuit_unit(out_node, out_port) {
+                        Some(unit)
+                    } else if out_node == io_nodes[0] {
+                        // passthrough from input to output
+                        Some(units_at_inputs[out_port.index()].clone())
+                    } else {
+                        None
+                    }
+                });
             if effective_units_at_outputs
                 .zip(units_at_outputs)
                 .any(|(u1, u2)| u1 != u2)
@@ -587,7 +612,13 @@ mod tests {
         }
 
         // Check that positions are strictly increasing along each resource path
-        for &(node, port) in rewritten_scope.subgraph().incoming_ports().iter().flatten() {
+        for &(node, port) in rewritten_scope
+            .subgraph()
+            .unwrap()
+            .incoming_ports()
+            .iter()
+            .flatten()
+        {
             let res = match rewritten_scope.get_circuit_unit(node, port).unwrap() {
                 CircuitUnit::Resource(resource_id) => resource_id,
                 CircuitUnit::Copyable(..) => {

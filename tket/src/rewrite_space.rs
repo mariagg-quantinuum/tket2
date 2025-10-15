@@ -6,7 +6,10 @@ use derive_more::derive::Error;
 use derive_more::derive::From;
 use derive_more::derive::Into;
 use hugr::hugr::views::NodesIter;
+use hugr::ops::OpTag;
+use hugr::ops::OpTrait;
 use hugr::persistent as hugr_im;
+use hugr::HugrView;
 use itertools::Itertools;
 use slotmap_fork_lmondada as slotmap;
 
@@ -250,6 +253,13 @@ impl<C> RewriteSpace<C> {
 
         while let Some((node, walker, depth)) = new_walker_queue.pop_front() {
             if !seen.insert(node) {
+                continue;
+            }
+
+            if [OpTag::Input, OpTag::Output].contains(&walker.as_hugr_view().get_optype(node).tag())
+            {
+                // We do not traverse IO nodes (they are typically connected to
+                // loads of stuff and no currently allowed rewrite may replace them)
                 continue;
             }
 

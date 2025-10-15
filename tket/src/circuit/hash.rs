@@ -133,7 +133,7 @@ fn hash_node<T: HugrView>(
     let mut hasher = FxHasher64::default();
 
     // Hash the node children
-    if circ.children(node).count() > 0 {
+    if circ.children(node).next().is_some() {
         circ.circuit_hash(node)?.hash(&mut hasher);
     }
 
@@ -172,6 +172,7 @@ pub enum HashError {
 mod test {
     use tket_json_rs::circuit_json;
 
+    use crate::serialize::pytket::DecodeOptions;
     use crate::serialize::TKETDecode;
     use crate::utils::build_simple_circuit;
     use crate::TketOp;
@@ -218,7 +219,7 @@ mod test {
     fn hash_constants() {
         let c_str = r#"{"bits": [], "commands": [{"args": [["q", [0]]], "op": {"params": ["0.5"], "type": "Rz"}}], "created_qubits": [], "discarded_qubits": [], "implicit_permutation": [[["q", [0]], ["q", [0]]]], "phase": "0.0", "qubits": [["q", [0]]]}"#;
         let ser: circuit_json::SerialCircuit = serde_json::from_str(c_str).unwrap();
-        let circ: Circuit = ser.decode().unwrap();
+        let circ: Circuit = ser.decode(DecodeOptions::new()).unwrap();
         circ.circuit_hash(circ.parent()).unwrap();
     }
 
@@ -230,7 +231,7 @@ mod test {
         let mut all_hashes = Vec::with_capacity(2);
         for c_str in [c_str1, c_str2] {
             let ser: circuit_json::SerialCircuit = serde_json::from_str(c_str).unwrap();
-            let circ: Circuit = ser.decode().unwrap();
+            let circ: Circuit = ser.decode(DecodeOptions::new()).unwrap();
             all_hashes.push(circ.circuit_hash(circ.parent()).unwrap());
         }
         assert_ne!(all_hashes[0], all_hashes[1]);

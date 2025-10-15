@@ -8,6 +8,7 @@ pub mod strategy;
 pub mod trace;
 
 use std::mem;
+use std::sync::Arc;
 
 use derive_more::derive::{Display, Error};
 #[cfg(feature = "portmatching")]
@@ -103,6 +104,31 @@ impl<N: HugrNode> NewCircuitRewrite<N> {
             .create_simple_replacement(circuit.hugr(), self.replacement.clone().into_hugr())
             .expect("rewrite is valid simple replacement")
     }
+
+    /// Create a new rewrite that can be applied to `hugr`.
+    pub fn try_new(
+        subcircuit: Subcircuit<N>,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+        replacement: Circuit,
+    ) -> Result<Self, InvalidRewrite> {
+        subcircuit.validate_subgraph(circuit).map_err(|err| {
+            InvalidRewrite::try_from(err).unwrap_or_else(|err| panic!("unknown error: {err}"))
+        })?;
+
+        let subcircuit_sig = subcircuit.dataflow_signature(circuit);
+        let replacement_sig = replacement.circuit_signature();
+        if subcircuit_sig != replacement_sig {
+            return Err(InvalidRewrite::InvalidSignature {
+                expected: subcircuit_sig,
+                actual: replacement_sig.into_owned(),
+            });
+        }
+
+        Ok(NewCircuitRewrite {
+            subcircuit,
+            replacement,
+        })
+    }
 }
 
 /// A rewrite rule for circuits, wrapping a HUGR [`SimpleReplacement`].
@@ -191,24 +217,23 @@ impl<N: HugrNode> CircuitRewrite<N> {
     }
 
     /// Convert the rewrite to the new format if it is in the old format.
-    pub fn ensure_new(
-        &mut self,
+    pub fn into_new(
+        self,
         circuit: &ResourceScope<impl HugrView<Node = N>>,
-    ) -> Result<(), InvalidRewrite> {
-        let repl = match self {
-            CircuitRewrite::New(..) => return Ok(()),
-            CircuitRewrite::Old(OldCircuitRewrite(old_circuit_rewrite)) => old_circuit_rewrite,
-        };
-
-        let subcircuit =
-            Subcircuit::try_from_nodes(repl.subgraph().nodes().iter().copied(), circuit)
-                .map_err(|_| InvalidRewrite::NonConvexSubgraph)?;
-        *self = CircuitRewrite::try_new(
-            subcircuit,
-            circuit,
-            Circuit::new(repl.replacement().clone()),
-        )?;
-        Ok(())
+    ) -> Result<NewCircuitRewrite<N>, InvalidRewrite> {
+        match self {
+            CircuitRewrite::New(rw) => Ok(rw),
+            CircuitRewrite::Old(OldCircuitRewrite(repl)) => {
+                let subcircuit =
+                    Subcircuit::try_from_nodes(repl.subgraph().nodes().iter().copied(), circuit)
+                        .map_err(|_| InvalidRewrite::NonConvexSubgraph)?;
+                NewCircuitRewrite::try_new(
+                    subcircuit,
+                    circuit,
+                    Circuit::new(repl.replacement().clone()),
+                )
+            }
+        }
     }
 
     /// Returns a set of nodes referenced by the rewrite. Modifying any these
@@ -291,7 +316,9 @@ impl<N: HugrNode> From<SimpleReplacement<N>> for CircuitRewrite<N> {
 /// root node.
 ///
 /// The generic argument `C` (default: [`Circuit`]) is the type of
-/// circuit to find rewrites on.
+/// circuit to find rewrites on. Currently, only arguments of type [`Circuit<H>`] are
+/// supported.
+
 pub trait Rewriter<C: NodesIter = Circuit> {
     /// The type of rewrite rule to return.
     type Rewrite;
@@ -342,21 +369,61 @@ impl<N: HugrNode> TryFrom<InvalidSubgraph<N>> for InvalidRewrite {
 ///
 /// The [`CircuitMatcher`] is used to find matches in the circuit, and the
 /// [`CircuitReplacer`] is used to create [`CircuitRewrite`]s for each match.
-#[derive(Clone, Debug)]
-pub struct MatchReplaceRewriter<C, R> {
+#[derive(Clone)]
+pub struct MatchReplaceRewriter<C: CircuitMatcher, R> {
     matcher: C,
     replacer: R,
     /// Name of the rewriter
     name: Option<String>,
+    /// Hash function for partial match info. If set, this is used to deduplicate
+    /// partial matches.
+    hash_partial_match_info:
+        Option<Arc<dyn Fn(&C::PartialMatchInfo, &mut fxhash::FxHasher) + Send + Sync>>,
+    /// Hash function for match info. If set, this is used to deduplicate
+    /// complete matches
+    hash_match_info: Option<Arc<dyn Fn(&C::MatchInfo, &mut fxhash::FxHasher) + Send + Sync>>,
 }
 
-impl<C, R> MatchReplaceRewriter<C, R> {
+impl<C: CircuitMatcher, R> MatchReplaceRewriter<C, R> {
     /// Create a new [`MatchReplaceRewriter`].
     pub fn new(matcher: C, replacement: R, name: Option<String>) -> Self {
         Self {
             matcher,
             replacer: replacement,
             name,
+            hash_partial_match_info: None,
+            hash_match_info: None,
+        }
+    }
+
+    /// Set the hash function for partial match info.
+    pub fn with_hash_partial_match_info(
+        self,
+        f: impl Fn(&C::PartialMatchInfo, &mut fxhash::FxHasher) + Send + Sync + 'static,
+    ) -> Self {
+        let mut new = self;
+        new.hash_partial_match_info = Some(Arc::new(f));
+        new
+    }
+
+    /// Set the hash function for complete match info.
+    pub fn with_hash_match_info(
+        self,
+        f: impl Fn(&C::MatchInfo, &mut fxhash::FxHasher) + Send + Sync + 'static,
+    ) -> Self {
+        let mut new = self;
+        new.hash_match_info = Some(Arc::new(f));
+        new
+    }
+
+    fn matching_options(&self) -> MatchingOptions<'_, C::PartialMatchInfo, C::MatchInfo> {
+        MatchingOptions {
+            deduplicate_partial_matches: self
+                .hash_partial_match_info
+                .as_ref()
+                .map(boxed_dyn_fn_ref),
+            deduplicate_complete_matches: self.hash_match_info.as_ref().map(boxed_dyn_fn_ref),
+            ..Default::default()
         }
     }
 }
@@ -371,19 +438,19 @@ fn compute_node_count_delta<N: HugrNode>(
     new_count - old_count
 }
 
-impl<C, R, H: HugrView<Node = hugr::Node>> Rewriter<ResourceScope<H>> for MatchReplaceRewriter<C, R>
+impl<C, R, H> Rewriter<ResourceScope<H>> for MatchReplaceRewriter<C, R>
 where
     C: CircuitMatcher,
     R: CircuitReplacer<C::MatchInfo>,
+    H: HugrView<Node = hugr::Node>,
 {
     type Rewrite = CircuitRewrite;
 
     fn get_rewrites(&self, circ: &ResourceScope<H>, root_node: H::Node) -> Vec<CircuitRewrite> {
-        let matches = self.matcher.as_hugr_matcher().get_matches(
-            circ,
-            root_node,
-            &MatchingOptions::default(),
-        );
+        let matches =
+            self.matcher
+                .as_hugr_matcher()
+                .get_matches(circ, root_node, &self.matching_options());
         matches
             .into_iter()
             .flat_map(|(subcirc, match_info)| {
@@ -407,7 +474,7 @@ where
         let matches = self
             .matcher
             .as_hugr_matcher()
-            .get_all_matches(circ, &MatchingOptions::default());
+            .get_all_matches(circ, &self.matching_options());
         matches
             .into_iter()
             .flat_map(|(subcirc, match_info)| {
@@ -428,16 +495,64 @@ where
     }
 }
 
+macro_rules! impl_rewriter_as_ref {
+    ($wrapper:ident) => {
+        impl<C: NodesIter, T: Rewriter<C> + ?Sized> Rewriter<C> for $wrapper<T> {
+            type Rewrite = T::Rewrite;
+
+            fn get_rewrites(
+                &self,
+                circ: &C,
+                root_node: <C as NodesIter>::Node,
+            ) -> Vec<Self::Rewrite> {
+                self.as_ref().get_rewrites(circ, root_node)
+            }
+
+            fn get_all_rewrites(&self, circ: &C) -> Vec<Self::Rewrite> {
+                self.as_ref().get_all_rewrites(circ)
+            }
+        }
+    };
+}
+
+impl_rewriter_as_ref!(Box);
+impl_rewriter_as_ref!(Arc);
+
+impl<C: NodesIter, T: Rewriter<C>> Rewriter<C> for Vec<T>
+where
+    C::Node: HugrNode,
+{
+    type Rewrite = T::Rewrite;
+
+    fn get_rewrites(&self, circ: &C, root_node: <C as NodesIter>::Node) -> Vec<Self::Rewrite> {
+        self.iter()
+            .flat_map(|rewriter| rewriter.get_rewrites(circ, root_node))
+            .collect()
+    }
+
+    fn get_all_rewrites(&self, circ: &C) -> Vec<Self::Rewrite> {
+        self.iter()
+            .flat_map(|rewriter| rewriter.get_all_rewrites(circ))
+            .collect()
+    }
+}
+
+fn boxed_dyn_fn_ref<T>(
+    f: &Arc<dyn Fn(&T, &mut fxhash::FxHasher) + Send + Sync>,
+) -> Box<dyn Fn(&T, &mut fxhash::FxHasher) + '_> {
+    Box::new(f.as_ref())
+}
+
 #[cfg(feature = "badgerv2_unstable")]
 mod badgerv2_unstable {
     use super::*;
-    use crate::{rewrite::matcher::ImMatchResult, rewrite_space::RewriteSpace};
-    use hugr::persistent::{Commit, CommitStateSpace, PatchNode, Walker};
+    use crate::rewrite::matcher::{CachedWalker, ImMatchResult};
+    use hugr::persistent::{Commit, CommitStateSpace, PatchNode};
 
     /// The string type for names describing rewrites.
     pub type RewriteName = Option<String>;
 
-    impl<'w, C, R> Rewriter<Walker<'w>> for MatchReplaceRewriter<C, R>
+    impl<'w, C, R> Rewriter<CachedWalker<'w>> for MatchReplaceRewriter<C, R>
     where
         C: CircuitMatcher,
         R: CircuitReplacer<C::MatchInfo>,
@@ -446,13 +561,14 @@ mod badgerv2_unstable {
 
         fn get_rewrites(
             &self,
-            walker: &Walker<'w>,
+            walker: &CachedWalker<'w>,
             root_node: PatchNode,
         ) -> Vec<(Commit<'w>, RewriteName)> {
-            let matches = self
-                .matcher
-                .as_rewrite_space_matcher()
-                .get_matches(walker.clone(), root_node);
+            let matches = self.matcher.as_rewrite_space_matcher().get_matches(
+                walker,
+                root_node,
+                &self.matching_options(),
+            );
             self.im_matches_to_commits(matches, walker.as_hugr_view().state_space())
                 // SAFETY: the commit is valid for the lifetime of the walker
                 .map(|commit| unsafe { commit.upgrade_lifetime() })
@@ -461,7 +577,7 @@ mod badgerv2_unstable {
         }
     }
 
-    impl<'c, C, R, Cost> Rewriter<&'c RewriteSpace<Cost>> for MatchReplaceRewriter<C, R>
+    /*impl<'c, C, R, Cost> Rewriter<&'c RewriteSpace<Cost>> for MatchReplaceRewriter<C, R>
     where
         C: CircuitMatcher,
         R: CircuitReplacer<C::MatchInfo>,
@@ -485,7 +601,7 @@ mod badgerv2_unstable {
             let matches = self
                 .matcher
                 .as_rewrite_space_matcher()
-                .get_all_matches(space);
+                .get_all_matches(space, &self.matching_options());
             self.im_matches_to_commits(matches, space.state_space())
                 .into_iter()
                 // SAFETY: the commit is valid for the lifetime of the rewrite space
@@ -493,7 +609,7 @@ mod badgerv2_unstable {
                 .map(|cm| (cm, self.name.clone()))
                 .collect()
         }
-    }
+    }*/
 
     impl<C, R> MatchReplaceRewriter<C, R>
     where

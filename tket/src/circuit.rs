@@ -352,6 +352,14 @@ impl<T: HugrView<Node = Node>> Circuit<T> {
         Ok(circ)
     }
 
+    /// Construct the subgraph containing the entire circuit.
+    pub fn subgraph(&self) -> Result<SiblingSubgraph, InvalidSubgraph>
+    where
+        T: Clone,
+    {
+        SiblingSubgraph::try_new_dataflow_subgraph::<_, DataflowParentID>(self.hugr())
+    }
+
     /// Compute the cost of the circuit based on a per-operation cost function.
     #[inline]
     pub fn circuit_cost<F, C>(&self, op_cost: F) -> C
@@ -361,16 +369,6 @@ impl<T: HugrView<Node = Node>> Circuit<T> {
         F: Fn(&OpType) -> C,
     {
         self.commands().map(|cmd| op_cost(cmd.optype())).sum()
-    }
-
-    /// The subgraph containing the entire circuit.
-    ///
-    /// Will return `None` if the circuit is empty.
-    pub fn try_to_subgraph(&self) -> Result<SiblingSubgraph, InvalidSubgraph>
-    where
-        T: Clone,
-    {
-        SiblingSubgraph::try_new_dataflow_subgraph::<_, DataflowParentID>(self.hugr())
     }
 }
 
@@ -682,6 +680,7 @@ mod tests {
     use super::*;
     use crate::extension::rotation::ConstRotation;
     use crate::serialize::load_tk1_json_str;
+    use crate::serialize::pytket::DecodeOptions;
     use crate::utils::build_simple_circuit;
     use crate::TketOp;
 
@@ -700,7 +699,7 @@ mod tests {
             ],
             "implicit_permutation": [[["q", [0]], ["q", [0]]], [["q", [1]], ["q", [1]]]]
         }"#,
-            None,
+            DecodeOptions::new(),
         )
         .unwrap()
     }

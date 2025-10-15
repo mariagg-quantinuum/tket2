@@ -481,6 +481,9 @@ impl<N: HugrNode> Subcircuit<N> {
                     Err(InvalidInterval::NotOnResourcePath(node)) => {
                         panic!("{resource_id:?} is not a valid resource for node {node:?}")
                     }
+                    Err(InvalidInterval::StartAfterEnd(_, _, _)) => {
+                        panic!("invalid interval for resource {resource_id:?}")
+                    }
                 }
             } else {
                 was_changed = true;
@@ -629,7 +632,7 @@ mod tests {
         #[case] description: &str,
     ) {
         let circ = cx_circuit(5);
-        let subgraph = Circuit::from(&circ).try_to_subgraph().unwrap();
+        let subgraph = Circuit::from(&circ).subgraph().unwrap();
         let cx_nodes = subgraph.nodes().to_owned();
         let scope = ResourceScope::new(&circ, subgraph);
 
@@ -661,7 +664,7 @@ mod tests {
         #[case] expected_copyable_inputs: usize,
     ) {
         let circ = cx_rz_circuit(2, true, true);
-        let subgraph = Circuit::from(&circ).try_to_subgraph().unwrap();
+        let subgraph = Circuit::from(&circ).subgraph().unwrap();
         let scope = ResourceScope::new(&circ, subgraph);
 
         let selected_nodes: Vec<_> = node_indices
@@ -698,7 +701,7 @@ mod tests {
     #[test]
     fn try_extend_cx_rz_circuit() {
         let circ = cx_rz_circuit(2, true, true);
-        let subgraph = Circuit::from(&circ).try_to_subgraph().unwrap();
+        let subgraph = Circuit::from(&circ).subgraph().unwrap();
         let circ = ResourceScope::new(circ, subgraph);
 
         let mut subcircuit = Subcircuit::new_empty();
@@ -775,7 +778,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let subgraph = circ.try_to_subgraph().unwrap();
+        let subgraph = circ.subgraph().unwrap();
         ResourceScope::new(circ.into_hugr(), subgraph)
     }
 
@@ -813,7 +816,7 @@ mod tests {
     #[test]
     fn test_to_subgraph() {
         let circ = cx_rz_circuit(2, true, false);
-        let subgraph = Circuit::from(&circ).try_to_subgraph().unwrap();
+        let subgraph = Circuit::from(&circ).subgraph().unwrap();
         let circ = ResourceScope::new(circ, subgraph);
 
         let mut subcircuit = Subcircuit::new_empty();
@@ -884,7 +887,7 @@ mod tests {
     #[test]
     fn test_to_subgraph_invalid() {
         let circ = cx_rz_circuit(2, true, false);
-        let subgraph = Circuit::from(&circ).try_to_subgraph().unwrap();
+        let subgraph = Circuit::from(&circ).subgraph().unwrap();
         let circ = ResourceScope::new(circ, subgraph);
 
         let mut subcircuit = Subcircuit::new_empty();

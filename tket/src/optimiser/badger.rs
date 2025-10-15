@@ -22,7 +22,7 @@ use hugr::hugr::views::sibling_subgraph::InvalidSubgraph;
 use hugr::hugr::HugrError;
 use hugr::{HugrView, Node};
 pub use log::BadgerLogger;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
@@ -233,14 +233,13 @@ where
         logger: BadgerLogger,
         opt: BadgerOptions,
     ) -> ResourceScope {
+        let backtracking = BacktrackingOptimiser::with_badger_options(&opt);
         let circ = circ.to_owned();
-
-        if circ.try_to_subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
+        if circ.subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
             // No rewrites possible in an empty circuit
             panic!("Empty circuit input not supported; no optimisation possible");
         }
 
-        let backtracking = BacktrackingOptimiser::with_badger_options(&opt);
         let circ = ResourceScope::from_circuit(circ);
         let cost = self.cost(&circ);
         let init_state = BadgerState { circ, cost };
@@ -266,7 +265,7 @@ where
         let n_threads: usize = opt.n_threads.get();
         let circ = circ.to_owned();
 
-        if circ.try_to_subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
+        if circ.subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
             // No rewrites possible in an empty circuit
             panic!("Empty circuit input not supported; no optimisation possible");
         }
@@ -414,7 +413,7 @@ where
         let start_time = Instant::now();
         let circ = circ.to_owned();
 
-        if circ.try_to_subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
+        if circ.subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
             // No rewrites possible in an empty circuit
             panic!("Empty circuit input not supported; no optimisation possible");
         }
@@ -584,6 +583,7 @@ mod tests {
     use rstest::{fixture, rstest};
 
     use crate::serialize::load_tk1_json_str;
+    use crate::serialize::pytket::DecodeOptions;
     use crate::{extension::rotation::rotation_type, optimiser::badger::BadgerOptions};
     use crate::{Circuit, TketOp};
 
@@ -630,7 +630,7 @@ mod tests {
     /// blindly from nam_6_3 matches.
     #[fixture]
     fn non_composable_rw_hugr() -> Circuit {
-        load_tk1_json_str(NON_COMPOSABLE, None).unwrap()
+        load_tk1_json_str(NON_COMPOSABLE, DecodeOptions::new()).unwrap()
     }
 
     /// A badger optimiser using a reduced set of rewrite rules.

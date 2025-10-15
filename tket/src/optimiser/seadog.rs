@@ -11,17 +11,20 @@
 //! stored to detect and ignore duplicates. The priority queue is truncated
 //! whenever it gets too large.
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use hugr::hugr::views::sibling_subgraph::InvalidSubgraph;
-use hugr::persistent::{Commit, PersistentHugr, Walker};
+use hugr::persistent::{Commit, PersistentHugr};
 use hugr::{HugrView, Node};
 
 use crate::circuit::cost::CircuitCost;
 use crate::circuit::CircuitHash;
 use crate::optimiser::{BacktrackingOptimiser, Optimiser, OptimiserOptions, State};
 use crate::resource::ResourceScope;
+use crate::rewrite::matcher::{CachedWalker, ResourceScopeCache};
 use crate::rewrite::strategy::RewriteStrategy;
 use crate::rewrite::{RewriteName, Rewriter};
 use crate::rewrite_space::{CommittedRewrite, RewriteMetadata, RewriteSpace};
@@ -60,6 +63,8 @@ pub struct SeadogOptions {
 
     /// The number of best rewrites to keep track of for the final SAT
     /// extraction.
+    ///
+    /// Defaults to `1000`.
     pub track_n_best: usize,
 
     /// The path to save the explored rewrite space to after optimisation.
@@ -73,7 +78,7 @@ impl Default for SeadogOptions {
             progress_timeout: Default::default(),
             queue_size: 20,
             max_circuit_count: None,
-            pattern_radius: 2,
+            pattern_radius: 4,
             track_n_best: 1000,
             save_rewrite_space: None,
         }
@@ -89,17 +94,17 @@ pub struct SeadogOptimiser<R, S> {
 
 /// A trait for rewriters that can be used with the Badger optimiser.
 pub trait SeadogRewriter<'w>:
-    Rewriter<Walker<'w>, Rewrite = (Commit<'w>, RewriteName)> + Send + Clone + Sync
+    Rewriter<CachedWalker<'w>, Rewrite = (Commit<'w>, RewriteName)>
 {
 }
 
 /// A trait for rewrite strategies that can be used with the Badger optimiser.
-pub trait SeadogRewriteStrategy: RewriteStrategy + Send + Sync + Clone + 'static {}
+pub trait SeadogRewriteStrategy: RewriteStrategy + 'static {}
 
-impl<S> SeadogRewriteStrategy for S where S: RewriteStrategy + Send + Sync + Clone + 'static {}
+impl<S> SeadogRewriteStrategy for S where S: RewriteStrategy + 'static {}
 
 impl<'w, R> SeadogRewriter<'w> for R where
-    R: Rewriter<Walker<'w>, Rewrite = (Commit<'w>, RewriteName)> + Send + Clone + Sync
+    R: Rewriter<CachedWalker<'w>, Rewrite = (Commit<'w>, RewriteName)> + ?Sized
 {
 }
 
@@ -138,6 +143,7 @@ struct SeadogContext<'o, R, S: SeadogRewriteStrategy> {
     rewrite_space: &'o RewriteSpace<Cost<S::Cost>>,
     optimiser: &'o SeadogOptimiser<R, S>,
     pattern_radius: usize,
+    cache: Rc<RefCell<ResourceScopeCache>>,
 }
 
 impl<'o, R, S> State<SeadogContext<'o, R, S>> for SeadogState<'o>
@@ -166,9 +172,19 @@ where
             .rewrite_space
             .nodes_within_radius(inserted_nodes, context.pattern_radius);
 
+        let cache = &context.cache;
+
         let rewrites = new_root_nodes
             .into_iter()
-            .flat_map(|(n, walker)| context.optimiser.rewriter.get_rewrites(&walker, n))
+            .flat_map(|(n, walker)| {
+                let cached_walker = CachedWalker {
+                    walker,
+                    cache: cache.clone(),
+                };
+                context.optimiser.rewriter.get_rewrites(&cached_walker, n)
+            })
+            // Filter out rewrites that do not apply on top of the current commit
+            .filter(|(rw, _)| rw.parents().any(|p| p.id() == commit.id()))
             .collect::<Vec<_>>();
 
         let mut commited_rewrites = Vec::with_capacity(rewrites.len());
@@ -225,7 +241,7 @@ impl<R, S> SeadogOptimiser<R, S>
 where
     R: for<'w> SeadogRewriter<'w>,
     S: SeadogRewriteStrategy,
-    S::Cost: serde::Serialize + Send + Sync,
+    S::Cost: serde::Serialize,
     <S::Cost as CircuitCost>::CostDelta: serde::Serialize + 'static,
 {
     /// Run the Badger optimiser on a circuit.
@@ -248,7 +264,7 @@ where
     ) -> PersistentHugr {
         let circ = circ.to_owned();
 
-        if circ.try_to_subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
+        if circ.subgraph() == Err(InvalidSubgraph::EmptySubgraph) {
             // No rewrites possible in an empty circuit
             panic!("Empty circuit input not supported; no optimisation possible");
         }
@@ -280,6 +296,7 @@ where
                     rewrite_space: &rewrite_space,
                     optimiser: self,
                     pattern_radius: opt.pattern_radius,
+                    cache: Rc::new(RefCell::new(ResourceScopeCache::new())),
                 },
                 OptimiserOptions {
                     track_n_best: Some(opt.track_n_best),

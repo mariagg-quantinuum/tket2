@@ -110,26 +110,6 @@ pub enum CircuitUnit<N: HugrNode> {
     Copyable(#[from] Wire<N>),
 }
 
-impl<N: HugrNode> From<CircuitUnit<N>> for hugr::CircuitUnit<N> {
-    fn from(value: CircuitUnit<N>) -> Self {
-        match value {
-            CircuitUnit::Resource(resource_id) => Self::Linear(resource_id.as_usize()),
-            CircuitUnit::Copyable(wire) => Self::Wire(wire),
-        }
-    }
-}
-
-impl<N: HugrNode> From<hugr::CircuitUnit<N>> for CircuitUnit<N> {
-    fn from(value: hugr::CircuitUnit<N>) -> Self {
-        match value {
-            hugr::CircuitUnit::Wire(wire) => CircuitUnit::Copyable(wire),
-            hugr::CircuitUnit::Linear(resource_id) => {
-                CircuitUnit::Resource(ResourceId::new(resource_id))
-            }
-        }
-    }
-}
-
 impl<N: HugrNode> CircuitUnit<N> {
     /// Map the node IDs in copyable values.
     pub(super) fn map_node<N2: HugrNode>(self, map_fn: impl FnOnce(N) -> N2) -> CircuitUnit<N2> {
@@ -277,7 +257,7 @@ impl<T> PortMap<T> {
 
 /// Allocator for ResourceIds that ensures they are assigned in increasing
 /// order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceAllocator {
     next_id: usize,
 }
@@ -285,7 +265,7 @@ pub struct ResourceAllocator {
 impl ResourceAllocator {
     /// Create a new ResourceAllocator starting from ID 0.
     pub fn new() -> Self {
-        Self { next_id: 0 }
+        Self::default()
     }
 
     /// Allocate the next available ResourceId.
@@ -293,11 +273,5 @@ impl ResourceAllocator {
         let id = ResourceId::new(self.next_id);
         self.next_id += 1;
         id
-    }
-}
-
-impl Default for ResourceAllocator {
-    fn default() -> Self {
-        Self::new()
     }
 }

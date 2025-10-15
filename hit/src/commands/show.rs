@@ -40,7 +40,7 @@ impl CommandExecutor for ShowCommand {
             ShowFormat::TketJson => {
                 // Print as TKET1 JSON
                 let circ = Circuit::new(current_hugr.to_hugr());
-                let ser_circ: SerialCircuit = TKETDecode::encode(&circ)
+                let ser_circ: SerialCircuit = TKETDecode::encode(&circ, Default::default())
                     .with_context(|| "could not express HUGR as TKET1 circuit")?;
                 serde_json::to_writer(std::io::stdout(), &ser_circ)?;
                 println!();

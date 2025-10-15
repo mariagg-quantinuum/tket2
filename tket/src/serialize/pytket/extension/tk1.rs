@@ -1,13 +1,11 @@
 //! Encoder for pytket operations that cannot be represented naturally in tket.
 
-use std::sync::Arc;
-
 use crate::extension::rotation::rotation_type;
 use crate::extension::{TKET1_EXTENSION, TKET1_EXTENSION_ID, TKET1_OP_NAME};
 use crate::serialize::pytket::decoder::{
     LoadedParameter, PytketDecoderContext, TrackedBit, TrackedQubit,
 };
-use crate::serialize::pytket::encoder::EncodeStatus;
+use crate::serialize::pytket::encoder::{EmitCommandOptions, EncodeStatus};
 use crate::serialize::pytket::{PytketDecodeError, PytketEncodeError, PytketEncoderContext};
 use crate::Circuit;
 
@@ -55,8 +53,7 @@ impl<H: HugrView> PytketEmitter<H> for Tk1Emitter {
         encoder.emit_node_command(
             node,
             circ,
-            // We don't support opaque pytket operations with parameter outputs.
-            |_args| Vec::new(),
+            EmitCommandOptions::new(),
             // Emit the pre-defined pytket operation stored in the metadata.
             move |_| op.serialised_op,
         )?;
@@ -80,7 +77,7 @@ pub(crate) fn build_opaque_tket_op<'h>(
     op: &tket_json_rs::circuit_json::Operation,
     qubits: &[TrackedQubit],
     bits: &[TrackedBit],
-    params: &[Arc<LoadedParameter>],
+    params: &[LoadedParameter],
     _opgroup: &Option<String>,
     decoder: &mut PytketDecoderContext<'h>,
 ) -> Result<(), PytketDecodeError> {
