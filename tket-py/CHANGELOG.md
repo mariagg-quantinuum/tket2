@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.13](https://github.com/CQCL/tket2/compare/tket-py-v0.12.12...tket-py-v0.12.13) (2025-11-25)
+
+
+### Features
+
+* Allow running arbitrary serializable pytket passes on hugrs ([#1266](https://github.com/CQCL/tket2/issues/1266)) ([24875e0](https://github.com/CQCL/tket2/commit/24875e06121a6929e842cc3f5c78126fc8bffc6f))
+
 ## [0.12.12](https://github.com/CQCL/tket2/compare/tket-py-v0.12.11...tket-py-v0.12.12) (2025-11-18)
 
 
