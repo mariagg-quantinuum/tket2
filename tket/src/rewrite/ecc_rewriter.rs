@@ -13,8 +13,8 @@
 //! of the Quartz repository.
 
 use derive_more::{Display, Error, From, Into};
-use hugr::envelope::serde_with::impl_serde_as_string_envelope;
 use hugr::extension::resolution::ExtensionResolutionError;
+use hugr::hugr::views::sibling_subgraph::TopoConvexChecker;
 use hugr::{Hugr, HugrView, Node, PortIndex};
 use itertools::Itertools;
 use portmatching::PatternID;
@@ -27,20 +27,18 @@ use std::{
 };
 
 use crate::extension::REGISTRY;
+use crate::resource::ResourceScope;
 use crate::{
     circuit::{remove_empty_wire, Circuit},
     optimiser::badger::{load_eccs_json_file, EqCircClass},
     portmatching::{CircuitPattern, PatternMatcher},
+    serialize::AsStringTk2Envelope,
 };
 
 use super::{CircuitRewrite, Rewriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, From, Into, serde::Serialize, serde::Deserialize)]
 struct TargetID(usize);
-
-struct AsStringTk2Envelope;
-
-impl_serde_as_string_envelope!(AsStringTk2Envelope, &REGISTRY);
 
 /// A rewriter based on circuit equivalence classes.
 ///
@@ -68,9 +66,9 @@ pub struct ECCRewriter {
 impl ECCRewriter {
     /// Create a new rewriter from equivalent circuit classes in JSON file.
     ///
-    /// This uses the Quartz JSON file format to store equivalent circuit classes.
-    /// Generate such a file using the `gen_ecc_set.sh` script at the root of
-    /// the Quartz repository.
+    /// This uses the Quartz JSON file format to store equivalent circuit
+    /// classes. Generate such a file using the `gen_ecc_set.sh` script at
+    /// the root of the Quartz repository.
     ///
     /// Quartz: <https://github.com/quantum-compiler/quartz/>.
     pub fn try_from_eccs_json_file(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -183,8 +181,9 @@ impl ECCRewriter {
         Self::load_binary_io(&mut file)
     }
 
-    /// When the ECC gets loaded, all custom operations are an instance of `OpaqueOp`.
-    /// We need to resolve them into `ExtensionOp`s by validating the definitions.
+    /// When the ECC gets loaded, all custom operations are an instance of
+    /// `OpaqueOp`. We need to resolve them into `ExtensionOp`s by
+    /// validating the definitions.
     fn resolve_extension_ops(&mut self) -> Result<(), ExtensionResolutionError> {
         self.targets
             .iter_mut()
@@ -192,9 +191,42 @@ impl ECCRewriter {
     }
 }
 
-impl Rewriter for ECCRewriter {
-    fn get_rewrites(&self, circ: &Circuit<impl HugrView<Node = Node>>) -> Vec<CircuitRewrite> {
-        let matches = self.matcher.find_matches(circ);
+impl<H: HugrView<Node = Node>> Rewriter<ResourceScope<H>> for ECCRewriter {
+    type Rewrite = CircuitRewrite;
+
+    fn get_rewrites(
+        &self,
+        circ: &ResourceScope<H>,
+        root_node: Node,
+    ) -> Vec<CircuitRewrite<H::Node>> {
+        self.get_rewrites(circ.hugr(), root_node)
+    }
+
+    fn get_all_rewrites(&self, circ: &ResourceScope<H>) -> Vec<CircuitRewrite<H::Node>> {
+        self.get_all_rewrites(circ.hugr())
+    }
+}
+
+impl<H: HugrView<Node = Node>> Rewriter<Circuit<H>> for ECCRewriter {
+    type Rewrite = CircuitRewrite;
+
+    fn get_rewrites(&self, circ: &Circuit<H>, root_node: Node) -> Vec<CircuitRewrite<H::Node>> {
+        self.get_rewrites(circ.hugr(), root_node)
+    }
+
+    fn get_all_rewrites(&self, circ: &Circuit<H>) -> Vec<CircuitRewrite<H::Node>> {
+        self.get_all_rewrites(circ.hugr())
+    }
+}
+
+impl<H: HugrView<Node = Node>> Rewriter<H> for ECCRewriter {
+    type Rewrite = CircuitRewrite;
+
+    fn get_rewrites(&self, h: &H, root_node: Node) -> Vec<CircuitRewrite> {
+        let circ = Circuit::new(h);
+        let circ_ref = &circ;
+        let checker = TopoConvexChecker::new(&h, circ.parent());
+        let matches = self.matcher.find_rooted_matches(&circ, root_node, &checker);
         matches
             .into_iter()
             .flat_map(|m| {
@@ -204,7 +236,26 @@ impl Rewriter for ECCRewriter {
                     for &empty_qb in self.empty_wires[pattern_id.0].iter().rev() {
                         remove_empty_wire(&mut repl, empty_qb).unwrap();
                     }
-                    m.to_rewrite(circ, repl).expect("invalid replacement")
+                    m.to_rewrite(circ_ref, repl).expect("invalid replacement")
+                })
+            })
+            .collect()
+    }
+
+    fn get_all_rewrites(&self, h: &H) -> Vec<CircuitRewrite> {
+        let circ = Circuit::new(h);
+        let circ_ref = &circ;
+        let matches = self.matcher.find_matches(&circ);
+        matches
+            .into_iter()
+            .flat_map(|m| {
+                let pattern_id = m.pattern_id();
+                self.get_targets(pattern_id).map(move |repl| {
+                    let mut repl = repl.to_owned();
+                    for &empty_qb in self.empty_wires[pattern_id.0].iter().rev() {
+                        remove_empty_wire(&mut repl, empty_qb).unwrap();
+                    }
+                    m.to_rewrite(circ_ref, repl).expect("invalid replacement")
                 })
             })
             .collect()
@@ -410,7 +461,7 @@ mod tests {
         let rewriter = ECCRewriter::try_from_eccs_json_file(test_file).unwrap();
 
         let cx_cx = cx_cx();
-        assert_eq!(rewriter.get_rewrites(&cx_cx).len(), 1);
+        assert_eq!(rewriter.get_all_rewrites(&cx_cx).len(), 1);
     }
 
     #[test]

@@ -2,125 +2,238 @@
 
 #[cfg(feature = "portmatching")]
 pub mod ecc_rewriter;
+pub mod matcher;
+pub mod replacer;
 pub mod strategy;
 pub mod trace;
 
-use bytemuck::TransparentWrapper;
+use std::mem;
+use std::sync::Arc;
+
+use derive_more::derive::{Display, Error};
 #[cfg(feature = "portmatching")]
 pub use ecc_rewriter::ECCRewriter;
 
 use derive_more::{From, Into};
 use hugr::core::HugrNode;
 use hugr::hugr::hugrmut::HugrMut;
-use hugr::hugr::patch::simple_replace;
-use hugr::hugr::views::sibling_subgraph::{InvalidReplacement, InvalidSubgraph};
+use hugr::hugr::patch::{simple_replace, PatchVerification};
+use hugr::hugr::views::sibling_subgraph::InvalidSubgraph;
+use hugr::hugr::views::NodesIter;
 use hugr::hugr::Patch;
 use hugr::types::Signature;
-use hugr::{
-    hugr::{views::SiblingSubgraph, SimpleReplacementError},
-    SimpleReplacement,
-};
-use hugr::{Hugr, HugrView, Node};
+use hugr::{hugr::views::SiblingSubgraph, SimpleReplacement};
+use hugr::{Hugr, HugrView};
+use itertools::{Either, Itertools};
+use matcher::{CircuitMatcher, MatchingOptions};
+use replacer::CircuitReplacer;
 
 use crate::circuit::Circuit;
+use crate::resource::{CircuitRewriteError, ResourceScope};
+pub use crate::Subcircuit;
 
-/// A subcircuit of a circuit.
-#[derive(Debug, Clone, From, Into)]
-#[repr(transparent)]
-pub struct Subcircuit<N = Node> {
-    pub(crate) subgraph: SiblingSubgraph<N>,
-}
-
-unsafe impl<N> TransparentWrapper<SiblingSubgraph<N>> for Subcircuit<N> {}
-
-impl<N: HugrNode> Subcircuit<N> {
-    /// Create a new subcircuit induced from a set of nodes.
-    pub fn try_from_nodes(
-        nodes: impl Into<Vec<N>>,
-        circ: &Circuit<impl HugrView<Node = N>>,
-    ) -> Result<Self, InvalidSubgraph<N>> {
-        let subgraph = SiblingSubgraph::try_from_nodes(nodes, circ.hugr())?;
-        Ok(Self { subgraph })
-    }
-
-    /// Nodes in the subcircuit.
-    pub fn nodes(&self) -> &[N] {
-        self.subgraph.nodes()
-    }
-
-    /// Number of nodes in the subcircuit.
-    pub fn node_count(&self) -> usize {
-        self.subgraph.node_count()
-    }
-
-    /// The signature of the subcircuit.
-    pub fn signature(&self, circ: &Circuit<impl HugrView<Node = N>>) -> Signature {
-        self.subgraph.signature(circ.hugr())
-    }
-}
-
-impl Subcircuit<Node> {
-    /// Create a rewrite rule to replace the subcircuit with a new circuit.
+/// A rewrite rule for circuits.
+///
+/// As a temporary solution, it support both old school [`SimpleReplacement`]s
+/// as well as the much more civilised approach using [`ResourceScope`] and
+/// [`Subcircuit`].
+// TODO: get rid of OldCircuitRewrite, Rename NewCircuitRewrite to CircuitRewrite
+#[derive(Debug, Clone, From)]
+pub enum CircuitRewrite<N: HugrNode = hugr::Node> {
+    /// A rewrite rule expressed as a subcircuit and replacement circuit.
+    New(NewCircuitRewrite<N>),
+    /// A rewrite rule expressed as a [`SimpleReplacement`].
     ///
-    /// # Parameters
-    /// * `circuit` - The base circuit that contains the subcircuit.
-    /// * `replacement` - The new circuit to replace the subcircuit with.
-    pub fn create_rewrite(
-        &self,
-        circuit: &Circuit<impl HugrView<Node = Node>>,
-        replacement: Circuit<impl HugrView<Node = Node>>,
-    ) -> Result<CircuitRewrite, InvalidReplacement> {
-        // The replacement must be a Dfg rooted hugr.
-        let replacement = replacement
-            .extract_dfg()
-            .unwrap_or_else(|e| panic!("{}", e))
-            .into_hugr();
-        Ok(CircuitRewrite(
-            self.subgraph
-                .create_simple_replacement(circuit.hugr(), replacement)?,
-        ))
+    /// Prefer using [`NewCircuitRewrite`] instead. It is much faster (but is
+    /// not yet supported in portmatching and the Python interface).
+    Old(#[from] OldCircuitRewrite<N>),
+}
+
+impl<N: HugrNode> PatchVerification for CircuitRewrite<N> {
+    type Error = CircuitRewriteError;
+
+    type Node = N;
+
+    fn verify(&self, h: &impl HugrView<Node = Self::Node>) -> Result<(), Self::Error> {
+        match self {
+            CircuitRewrite::New(rewrite) => rewrite.verify(h),
+            CircuitRewrite::Old(OldCircuitRewrite(repl)) => repl
+                .verify(h)
+                .map_err(CircuitRewriteError::new_simple_replacement_error),
+        }
+    }
+}
+
+impl<N: HugrNode> PatchVerification for NewCircuitRewrite<N> {
+    type Error = CircuitRewriteError;
+
+    type Node = N;
+
+    fn verify(&self, _h: &impl HugrView<Node = Self::Node>) -> Result<(), Self::Error> {
+        unimplemented!()
+        // let circ = ResourceScope::from_circuit(Circuit::new(h));
+        // self.to_simple_replacement(&circ)
+        //     .verify(circ.hugr())
+        //     .map_err(Into::into)
     }
 }
 
 /// A rewrite rule for circuits.
-#[derive(Debug, Clone, From, Into)]
-pub struct CircuitRewrite<N = Node>(SimpleReplacement<N>);
+///
+/// The following invariants hold:
+///  - the subcircuit is not empty
+///  - the subcircuit is convex
+#[derive(Debug, Clone)]
+pub struct NewCircuitRewrite<N: HugrNode = hugr::Node> {
+    pub(crate) subcircuit: Subcircuit<N>,
+    pub(crate) replacement: Circuit,
+}
 
-impl CircuitRewrite {
-    /// Create a new rewrite rule.
+impl<N: HugrNode> NewCircuitRewrite<N> {
+    /// Construct a [`SimpleReplacement`] that executes the rewrite as a HUGR
+    /// operation.
+    pub fn to_simple_replacement(
+        &self,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+    ) -> SimpleReplacement<N> {
+        let subgraph = self
+            .subcircuit
+            .try_to_subgraph(circuit)
+            .expect("subcircuit is valid subgraph");
+        subgraph
+            .create_simple_replacement(circuit.hugr(), self.replacement.clone().into_hugr())
+            .expect("rewrite is valid simple replacement")
+    }
+
+    /// Create a new rewrite that can be applied to `hugr`.
     pub fn try_new(
-        circuit_position: &Subcircuit,
-        circuit: &Circuit<impl HugrView<Node = Node>>,
-        replacement: Circuit<impl HugrView<Node = Node>>,
-    ) -> Result<Self, InvalidReplacement> {
-        let replacement = replacement
-            .extract_dfg()
-            .unwrap_or_else(|e| panic!("{}", e))
-            .into_hugr();
-        circuit_position
-            .subgraph
-            .create_simple_replacement(circuit.hugr(), replacement)
-            .map(Self)
+        subcircuit: Subcircuit<N>,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+        replacement: Circuit,
+    ) -> Result<Self, InvalidRewrite> {
+        subcircuit.validate_subgraph(circuit).map_err(|err| {
+            InvalidRewrite::try_from(err).unwrap_or_else(|err| panic!("unknown error: {err}"))
+        })?;
+
+        let subcircuit_sig = subcircuit.dataflow_signature(circuit);
+        let replacement_sig = replacement.circuit_signature();
+        if subcircuit_sig != replacement_sig {
+            return Err(InvalidRewrite::InvalidSignature {
+                expected: subcircuit_sig,
+                actual: replacement_sig.into_owned(),
+            });
+        }
+
+        Ok(NewCircuitRewrite {
+            subcircuit,
+            replacement,
+        })
+    }
+}
+
+/// A rewrite rule for circuits, wrapping a HUGR [`SimpleReplacement`].
+///
+/// You should migrate to using [`NewCircuitRewrite`] instead. It is much
+/// faster.
+#[derive(Debug, Clone, From, Into)]
+pub struct OldCircuitRewrite<N = hugr::Node>(pub(crate) SimpleReplacement<N>);
+
+impl<N: HugrNode> CircuitRewrite<N> {
+    /// Create a new rewrite that can be applied to `hugr`.
+    pub fn try_new(
+        subcircuit: Subcircuit<N>,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+        replacement: Circuit,
+    ) -> Result<Self, InvalidRewrite> {
+        subcircuit.validate_subgraph(circuit).map_err(|err| {
+            InvalidRewrite::try_from(err).unwrap_or_else(|err| panic!("unknown error: {err}"))
+        })?;
+
+        let subcircuit_sig = subcircuit.dataflow_signature(circuit);
+        let replacement_sig = replacement.circuit_signature();
+        if subcircuit_sig != replacement_sig {
+            return Err(InvalidRewrite::InvalidSignature {
+                expected: subcircuit_sig,
+                actual: replacement_sig.into_owned(),
+            });
+        }
+
+        Ok(Self::New(NewCircuitRewrite {
+            subcircuit,
+            replacement,
+        }))
     }
 
     /// Number of nodes added or removed by the rewrite.
     ///
     /// The difference between the new number of nodes minus the old. A positive
     /// number is an increase in node count, a negative number is a decrease.
-    pub fn node_count_delta(&self) -> isize {
-        let new_count = self.replacement().num_operations() as isize;
-        let old_count = self.subcircuit().node_count() as isize;
-        new_count - old_count
+    pub fn node_count_delta(&self, circuit: &ResourceScope<impl HugrView<Node = N>>) -> isize {
+        match self {
+            Self::New(rewrite) => {
+                compute_node_count_delta(&rewrite.subcircuit, rewrite.replacement.hugr(), circuit)
+            }
+            Self::Old(OldCircuitRewrite(simple_replacement)) => {
+                let old_count = simple_replacement.subgraph().node_count() as isize;
+                let new_count =
+                    Circuit::new(simple_replacement.replacement()).num_operations() as isize;
+                new_count - old_count
+            }
+        }
     }
 
-    /// The subcircuit that is replaced.
-    pub fn subcircuit(&self) -> &Subcircuit {
-        Subcircuit::wrap_ref(self.0.subgraph())
+    /// Construct a [`SiblingSubgraph`] that represents the subcircuit being
+    /// replaced.
+    pub fn to_subgraph(
+        &self,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+    ) -> SiblingSubgraph<N> {
+        match self {
+            Self::New(rewrite) => rewrite
+                .subcircuit
+                .try_to_subgraph(circuit)
+                .expect("subcircuit is valid subgraph"),
+            Self::Old(rewrite) => rewrite.0.subgraph().to_owned(),
+        }
     }
 
     /// The replacement subcircuit.
-    pub fn replacement(&self) -> Circuit<&Hugr> {
-        self.0.replacement().into()
+    pub fn replacement(&self) -> &Hugr {
+        match self {
+            Self::New(rewrite) => rewrite.replacement.hugr(),
+            Self::Old(rewrite) => rewrite.0.replacement(),
+        }
+    }
+
+    /// Construct a [`SimpleReplacement`] that executes the rewrite as a HUGR
+    /// operation.
+    pub fn to_simple_replacement(
+        &self,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+    ) -> SimpleReplacement<N> {
+        self.to_subgraph(circuit)
+            .create_simple_replacement(circuit.hugr(), self.replacement().to_owned())
+            .expect("rewrite is valid simple replacement")
+    }
+
+    /// Convert the rewrite to the new format if it is in the old format.
+    pub fn into_new(
+        self,
+        circuit: &ResourceScope<impl HugrView<Node = N>>,
+    ) -> Result<NewCircuitRewrite<N>, InvalidRewrite> {
+        match self {
+            CircuitRewrite::New(rw) => Ok(rw),
+            CircuitRewrite::Old(OldCircuitRewrite(repl)) => {
+                let subcircuit =
+                    Subcircuit::try_from_nodes(repl.subgraph().nodes().iter().copied(), circuit)
+                        .map_err(|_| InvalidRewrite::NonConvexSubgraph)?;
+                NewCircuitRewrite::try_new(
+                    subcircuit,
+                    circuit,
+                    Circuit::new(repl.replacement().clone()),
+                )
+            }
+        }
     }
 
     /// Returns a set of nodes referenced by the rewrite. Modifying any these
@@ -129,32 +242,541 @@ impl CircuitRewrite {
     /// Two `CircuitRewrite`s can be composed if their invalidation sets are
     /// disjoint.
     #[inline]
-    pub fn invalidation_set(&self) -> impl Iterator<Item = Node> + '_ {
-        self.0.invalidation_set()
+    pub fn invalidation_set<'a>(
+        &'a self,
+        circuit: &'a ResourceScope<impl HugrView<Node = N>>,
+    ) -> impl Iterator<Item = N> + 'a {
+        match self {
+            Self::New(rewrite) => Either::Left(rewrite.subcircuit.nodes(circuit)),
+            Self::Old(rewrite) => Either::Right(rewrite.0.subgraph().nodes().iter().copied()),
+        }
     }
+}
 
+impl CircuitRewrite {
     /// Apply the rewrite rule to a circuit.
     #[inline]
     pub fn apply(
         self,
-        circ: &mut Circuit<impl HugrMut<Node = Node>>,
-    ) -> Result<simple_replace::Outcome<Node>, SimpleReplacementError> {
+        circ: &mut ResourceScope<impl HugrMut<Node = hugr::Node>>,
+    ) -> Result<simple_replace::Outcome, CircuitRewriteError> {
         circ.add_rewrite_trace(&self);
-        self.0.apply(circ.hugr_mut())
+        circ.apply_rewrite(self)
     }
 
-    /// Apply the rewrite rule to a circuit, without registering it in the rewrite trace.
+    /// Apply the rewrite rule to a circuit, without registering it in the
+    /// rewrite trace.
     #[inline]
     pub fn apply_notrace(
         self,
-        circ: &mut Circuit<impl HugrMut<Node = Node>>,
-    ) -> Result<simple_replace::Outcome<Node>, SimpleReplacementError> {
-        self.0.apply(circ.hugr_mut())
+        circ: &mut ResourceScope<impl HugrMut<Node = hugr::Node>>,
+    ) -> Result<simple_replace::Outcome, CircuitRewriteError> {
+        circ.apply_rewrite(self)
+    }
+}
+
+impl<H: HugrMut<Node = hugr::Node>> Patch<H> for CircuitRewrite {
+    type Outcome = simple_replace::Outcome;
+
+    const UNCHANGED_ON_FAILURE: bool = true;
+
+    fn apply(self, h: &mut H) -> Result<Self::Outcome, Self::Error> {
+        let mut circ = Circuit::new(h);
+        <Self as Patch<Circuit<&mut H>>>::apply(self, &mut circ)
+    }
+}
+
+impl<H: HugrMut<Node = hugr::Node>> Patch<Circuit<H>> for CircuitRewrite {
+    type Outcome = simple_replace::Outcome;
+
+    const UNCHANGED_ON_FAILURE: bool = true;
+
+    fn apply(self, h: &mut Circuit<H>) -> Result<Self::Outcome, Self::Error> {
+        match self {
+            CircuitRewrite::New(..) => {
+                unimplemented!("use ResourceScope with new rewrite type")
+            }
+            CircuitRewrite::Old(OldCircuitRewrite(repl)) => repl
+                .apply(h.hugr_mut())
+                .map_err(CircuitRewriteError::new_simple_replacement_error),
+        }
+    }
+}
+
+impl<N: HugrNode> From<SimpleReplacement<N>> for CircuitRewrite<N> {
+    fn from(value: SimpleReplacement<N>) -> Self {
+        OldCircuitRewrite(value).into()
     }
 }
 
 /// Generate rewrite rules for circuits.
-pub trait Rewriter {
-    /// Get the rewrite rules for a circuit.
-    fn get_rewrites(&self, circ: &Circuit<impl HugrView<Node = Node>>) -> Vec<CircuitRewrite>;
+///
+/// Every rewrite must have one designated root node in its left hand side (the
+/// match). The API allows for queries that only find rewrites with a specific
+/// root node.
+///
+/// The generic argument `C` (default: [`Circuit`]) is the type of
+/// circuit to find rewrites on. Currently, only arguments of type [`Circuit<H>`] are
+/// supported.
+
+pub trait Rewriter<C: NodesIter = Circuit> {
+    /// The type of rewrite rule to return.
+    type Rewrite;
+
+    /// Get the rewrite rules for a circuit with the given root node.
+    fn get_rewrites(&self, circ: &C, root_node: C::Node) -> Vec<Self::Rewrite>;
+
+    /// Get the rewrite rules for a circuit with all root nodes.
+    fn get_all_rewrites(&self, circ: &C) -> Vec<Self::Rewrite> {
+        circ.nodes()
+            .flat_map(|n| self.get_rewrites(circ, n))
+            .collect()
+    }
+}
+
+/// An error that can occur when constructing a rewrite rule.
+#[derive(Debug, Clone, PartialEq, Display, Error)]
+#[non_exhaustive]
+pub enum InvalidRewrite {
+    /// The LHS subcircuit is not convex.
+    #[display("The LHS subcircuit is not convex.")]
+    NonConvexSubgraph,
+    /// The LHS subcircuit is empty.
+    #[display("The LHS subcircuit is empty.")]
+    EmptySubgraph,
+    /// The left and right hand sides have mismatched signatures.
+    #[display("The left and right hand sides have mismatched signatures: expected {expected:?}, got {actual:?}.")]
+    InvalidSignature {
+        /// The expected signature.
+        expected: Signature,
+        /// The actual signature.
+        actual: Signature,
+    },
+}
+
+impl<N: HugrNode> TryFrom<InvalidSubgraph<N>> for InvalidRewrite {
+    type Error = &'static str;
+
+    fn try_from(value: InvalidSubgraph<N>) -> Result<Self, Self::Error> {
+        match value {
+            InvalidSubgraph::NotConvex => Ok(InvalidRewrite::NonConvexSubgraph),
+            InvalidSubgraph::EmptySubgraph => Ok(InvalidRewrite::EmptySubgraph),
+            _ => return Err("Unexpected InvalidSubgraph error"),
+        }
+    }
+}
+/// A rewriter made of a [`CircuitMatcher`] and a [`CircuitReplacer`].
+///
+/// The [`CircuitMatcher`] is used to find matches in the circuit, and the
+/// [`CircuitReplacer`] is used to create [`CircuitRewrite`]s for each match.
+#[derive(Clone)]
+pub struct MatchReplaceRewriter<C: CircuitMatcher, R> {
+    matcher: C,
+    replacer: R,
+    /// Name of the rewriter
+    name: Option<String>,
+    /// Hash function for partial match info. If set, this is used to deduplicate
+    /// partial matches.
+    hash_partial_match_info:
+        Option<Arc<dyn Fn(&C::PartialMatchInfo, &mut fxhash::FxHasher) + Send + Sync>>,
+    /// Hash function for match info. If set, this is used to deduplicate
+    /// complete matches
+    hash_match_info: Option<Arc<dyn Fn(&C::MatchInfo, &mut fxhash::FxHasher) + Send + Sync>>,
+}
+
+impl<C: CircuitMatcher, R> MatchReplaceRewriter<C, R> {
+    /// Create a new [`MatchReplaceRewriter`].
+    pub fn new(matcher: C, replacement: R, name: Option<String>) -> Self {
+        Self {
+            matcher,
+            replacer: replacement,
+            name,
+            hash_partial_match_info: None,
+            hash_match_info: None,
+        }
+    }
+
+    /// Set the hash function for partial match info.
+    pub fn with_hash_partial_match_info(
+        self,
+        f: impl Fn(&C::PartialMatchInfo, &mut fxhash::FxHasher) + Send + Sync + 'static,
+    ) -> Self {
+        let mut new = self;
+        new.hash_partial_match_info = Some(Arc::new(f));
+        new
+    }
+
+    /// Set the hash function for complete match info.
+    pub fn with_hash_match_info(
+        self,
+        f: impl Fn(&C::MatchInfo, &mut fxhash::FxHasher) + Send + Sync + 'static,
+    ) -> Self {
+        let mut new = self;
+        new.hash_match_info = Some(Arc::new(f));
+        new
+    }
+
+    fn matching_options(&self) -> MatchingOptions<'_, C::PartialMatchInfo, C::MatchInfo> {
+        MatchingOptions {
+            deduplicate_partial_matches: self
+                .hash_partial_match_info
+                .as_ref()
+                .map(boxed_dyn_fn_ref),
+            deduplicate_complete_matches: self.hash_match_info.as_ref().map(boxed_dyn_fn_ref),
+            ..Default::default()
+        }
+    }
+}
+
+fn compute_node_count_delta<N: HugrNode>(
+    subcircuit: &Subcircuit<N>,
+    replacement: &Hugr,
+    circuit: &ResourceScope<impl HugrView<Node = N>>,
+) -> isize {
+    let new_count = Circuit::new(replacement).num_operations() as isize;
+    let old_count = subcircuit.nodes(circuit).count() as isize;
+    new_count - old_count
+}
+
+impl<C, R, H> Rewriter<ResourceScope<H>> for MatchReplaceRewriter<C, R>
+where
+    C: CircuitMatcher,
+    R: CircuitReplacer<C::MatchInfo>,
+    H: HugrView<Node = hugr::Node>,
+{
+    type Rewrite = CircuitRewrite;
+
+    fn get_rewrites(&self, circ: &ResourceScope<H>, root_node: H::Node) -> Vec<CircuitRewrite> {
+        let matches =
+            self.matcher
+                .as_hugr_matcher()
+                .get_matches(circ, root_node, &self.matching_options());
+        matches
+            .into_iter()
+            .flat_map(|(subcirc, match_info)| {
+                self.replacer
+                    .replace_match(&subcirc, circ, match_info)
+                    .into_iter()
+                    .filter_map(move |repl| {
+                        match CircuitRewrite::try_new(subcirc.clone(), circ, repl) {
+                            Ok(ok) => Some(ok),
+                            Err(err) => {
+                                eprintln!("Error: failed to create rewrite, skipping:\n{}", err);
+                                None
+                            }
+                        }
+                    })
+            })
+            .collect()
+    }
+
+    fn get_all_rewrites(&self, circ: &ResourceScope<H>) -> Vec<CircuitRewrite> {
+        let matches = self
+            .matcher
+            .as_hugr_matcher()
+            .get_all_matches(circ, &self.matching_options());
+        matches
+            .into_iter()
+            .flat_map(|(subcirc, match_info)| {
+                self.replacer
+                    .replace_match(&subcirc, circ, match_info)
+                    .into_iter()
+                    .filter_map(move |repl| {
+                        match CircuitRewrite::try_new(subcirc.clone(), circ, repl) {
+                            Ok(ok) => Some(ok),
+                            Err(err) => {
+                                eprintln!("Error: failed to create rewrite, skipping:\n{}", err);
+                                None
+                            }
+                        }
+                    })
+            })
+            .collect()
+    }
+}
+
+macro_rules! impl_rewriter_as_ref {
+    ($wrapper:ident) => {
+        impl<C: NodesIter, T: Rewriter<C> + ?Sized> Rewriter<C> for $wrapper<T> {
+            type Rewrite = T::Rewrite;
+
+            fn get_rewrites(
+                &self,
+                circ: &C,
+                root_node: <C as NodesIter>::Node,
+            ) -> Vec<Self::Rewrite> {
+                self.as_ref().get_rewrites(circ, root_node)
+            }
+
+            fn get_all_rewrites(&self, circ: &C) -> Vec<Self::Rewrite> {
+                self.as_ref().get_all_rewrites(circ)
+            }
+        }
+    };
+}
+
+impl_rewriter_as_ref!(Box);
+impl_rewriter_as_ref!(Arc);
+
+impl<C: NodesIter, T: Rewriter<C>> Rewriter<C> for Vec<T>
+where
+    C::Node: HugrNode,
+{
+    type Rewrite = T::Rewrite;
+
+    fn get_rewrites(&self, circ: &C, root_node: <C as NodesIter>::Node) -> Vec<Self::Rewrite> {
+        self.iter()
+            .flat_map(|rewriter| rewriter.get_rewrites(circ, root_node))
+            .collect()
+    }
+
+    fn get_all_rewrites(&self, circ: &C) -> Vec<Self::Rewrite> {
+        self.iter()
+            .flat_map(|rewriter| rewriter.get_all_rewrites(circ))
+            .collect()
+    }
+}
+
+fn boxed_dyn_fn_ref<T>(
+    f: &Arc<dyn Fn(&T, &mut fxhash::FxHasher) + Send + Sync>,
+) -> Box<dyn Fn(&T, &mut fxhash::FxHasher) + '_> {
+    Box::new(f.as_ref())
+}
+
+#[cfg(feature = "badgerv2_unstable")]
+mod badgerv2_unstable {
+    use super::*;
+    use crate::rewrite::matcher::{CachedWalker, ImMatchResult};
+    use hugr::persistent::{Commit, CommitStateSpace, PatchNode};
+
+    /// The string type for names describing rewrites.
+    pub type RewriteName = Option<String>;
+
+    impl<'w, C, R> Rewriter<CachedWalker<'w>> for MatchReplaceRewriter<C, R>
+    where
+        C: CircuitMatcher,
+        R: CircuitReplacer<C::MatchInfo>,
+    {
+        type Rewrite = (Commit<'w>, RewriteName);
+
+        fn get_rewrites(
+            &self,
+            walker: &CachedWalker<'w>,
+            root_node: PatchNode,
+        ) -> Vec<(Commit<'w>, RewriteName)> {
+            let matches = self.matcher.as_rewrite_space_matcher().get_matches(
+                walker,
+                root_node,
+                &self.matching_options(),
+            );
+            self.im_matches_to_commits(matches, walker.as_hugr_view().state_space())
+                // SAFETY: the commit is valid for the lifetime of the walker
+                .map(|commit| unsafe { commit.upgrade_lifetime() })
+                .map(|cm| (cm, self.name.clone()))
+                .collect()
+        }
+    }
+
+    /*impl<'c, C, R, Cost> Rewriter<&'c RewriteSpace<Cost>> for MatchReplaceRewriter<C, R>
+    where
+        C: CircuitMatcher,
+        R: CircuitReplacer<C::MatchInfo>,
+    {
+        type Rewrite = (Commit<'c>, RewriteName);
+
+        fn get_rewrites(
+            &self,
+            space: &&'c RewriteSpace<Cost>,
+            root_node: PatchNode,
+        ) -> Vec<(Commit<'c>, RewriteName)> {
+            let walker = Walker::from_pinned_node(root_node, space.state_space());
+            self.get_rewrites(&walker, root_node)
+                .into_iter()
+                // SAFETY: the commit is valid for the lifetime of the rewrite space
+                .map(|(commit, name)| (unsafe { commit.upgrade_lifetime() }, name))
+                .collect()
+        }
+
+        fn get_all_rewrites(&self, space: &&'c RewriteSpace<Cost>) -> Vec<Self::Rewrite> {
+            let matches = self
+                .matcher
+                .as_rewrite_space_matcher()
+                .get_all_matches(space, &self.matching_options());
+            self.im_matches_to_commits(matches, space.state_space())
+                .into_iter()
+                // SAFETY: the commit is valid for the lifetime of the rewrite space
+                .map(|commit| unsafe { commit.upgrade_lifetime() })
+                .map(|cm| (cm, self.name.clone()))
+                .collect()
+        }
+    }*/
+
+    impl<C, R> MatchReplaceRewriter<C, R>
+    where
+        C: CircuitMatcher,
+        R: CircuitReplacer<C::MatchInfo>,
+    {
+        fn im_matches_to_commits<'c>(
+            &'c self,
+            matches: Vec<ImMatchResult<C::MatchInfo>>,
+            state_space: &'c CommitStateSpace,
+        ) -> impl Iterator<Item = Commit<'c>> + 'c {
+            matches.into_iter().flat_map(
+                move |ImMatchResult {
+                          subcircuit,
+                          subgraph,
+                          match_info,
+                          hugr,
+                      }| {
+                    self.replacer
+                        .replace_match(&subcircuit, &hugr, match_info)
+                        .into_iter()
+                        .filter_map(move |repl| {
+                            let rw = match CircuitRewrite::try_new(subcircuit.clone(), &hugr, repl)
+                            {
+                                Ok(ok) => Some(ok),
+                                Err(err) => {
+                                    eprintln!(
+                                        "Error: failed to create rewrite, skipping:\n{}",
+                                        err
+                                    );
+                                    None
+                                }
+                            }?;
+                            let parents = subgraph
+                                .selected_commits()
+                                .map(|id| hugr.hugr().get_commit(id).clone());
+                            let repl = rw.to_simple_replacement(&hugr);
+                            Commit::try_new(repl, parents, state_space).ok()
+                        })
+                },
+            )
+        }
+    }
+}
+#[cfg(feature = "badgerv2_unstable")]
+pub use badgerv2_unstable::RewriteName;
+
+/// A rewriter that combines multiple [`CircuitMatcher`]s before passing the
+/// combined match to a [`CircuitReplacer`].
+///
+/// The [`CircuitMatcher`]s are used to find matches in the circuit. All
+/// cartesian products of the matches that are convex are then passed to the
+/// [`CircuitReplacer`] to create [`CircuitRewrite`]s.
+#[derive(Clone, Debug)]
+pub struct CombineMatchReplaceRewriter<C, R> {
+    matchers: Vec<C>,
+    replacer: R,
+}
+
+impl<C, R> CombineMatchReplaceRewriter<C, R> {
+    /// Create a new [`MatchReplaceRewriter`].
+    pub fn new(matchers: Vec<C>, replacement: R) -> Self {
+        Self {
+            matchers,
+            replacer: replacement,
+        }
+    }
+}
+
+impl<C, R, H: HugrView<Node = hugr::Node>> Rewriter<ResourceScope<H>>
+    for CombineMatchReplaceRewriter<C, R>
+where
+    C: CircuitMatcher,
+    C::MatchInfo: Clone,
+    R: CircuitReplacer<Vec<C::MatchInfo>>,
+{
+    type Rewrite = CircuitRewrite;
+
+    fn get_rewrites(&self, circ: &ResourceScope<H>, root_node: hugr::Node) -> Vec<CircuitRewrite> {
+        let mut is_first = true;
+        let all_matches = self
+            .matchers
+            .iter()
+            .map(|m| {
+                if is_first {
+                    is_first = false;
+                    m.as_hugr_matcher()
+                        .get_matches(circ, root_node, &MatchingOptions::default())
+                } else {
+                    m.as_hugr_matcher()
+                        .get_all_matches(circ, &MatchingOptions::default())
+                }
+            })
+            .collect_vec();
+        convex_cartesian_product(all_matches, circ)
+            .into_iter()
+            .flat_map(|(subcirc, match_info)| {
+                self.replacer
+                    .replace_match(&subcirc, circ, match_info)
+                    .into_iter()
+                    .filter_map(move |repl| {
+                        match CircuitRewrite::try_new(subcirc.clone(), circ, repl) {
+                            Ok(ok) => Some(ok),
+                            Err(err) => {
+                                eprintln!("Error: failed to create rewrite, skipping:\n{}", err);
+                                None
+                            }
+                        }
+                    })
+            })
+            .collect()
+    }
+
+    fn get_all_rewrites(&self, circ: &ResourceScope<H>) -> Vec<CircuitRewrite> {
+        let all_matches = self
+            .matchers
+            .iter()
+            .map(|m| {
+                m.as_hugr_matcher()
+                    .get_all_matches(circ, &MatchingOptions::default())
+            })
+            .collect_vec();
+        convex_cartesian_product(all_matches, circ)
+            .into_iter()
+            .flat_map(|(subcirc, match_info)| {
+                self.replacer
+                    .replace_match(&subcirc, circ, match_info)
+                    .into_iter()
+                    .filter_map(move |repl| {
+                        match CircuitRewrite::try_new(subcirc.clone(), circ, repl) {
+                            Ok(ok) => Some(ok),
+                            Err(err) => {
+                                eprintln!("Error: failed to create rewrite, skipping:\n{}", err);
+                                None
+                            }
+                        }
+                    })
+            })
+            .collect()
+    }
+}
+
+fn convex_cartesian_product<N: HugrNode, M: Clone>(
+    all_matches: Vec<Vec<(Subcircuit<N>, M)>>,
+    circ: &ResourceScope<impl HugrView<Node = N>>,
+) -> Vec<(Subcircuit<N>, Vec<M>)> {
+    let mut combined_matches = vec![(Subcircuit::new_empty(), vec![])];
+
+    let mut new_combined_matches = Vec::new();
+    for matches in all_matches {
+        for (subcirc, match_info) in combined_matches {
+            // combine with each match in matches
+            for (subcirc2, match_info2) in matches.clone() {
+                let mut new_subcirc = subcirc.clone();
+                let mut new_match_info = match_info.clone();
+                new_subcirc.try_extend(subcirc2);
+
+                // Check that the combined subcircuit is convex
+                if new_subcirc.validate_subgraph(circ).is_ok() {
+                    new_match_info.push(match_info2);
+                    new_combined_matches.push((new_subcirc, new_match_info));
+                }
+            }
+        }
+
+        combined_matches = mem::take(&mut new_combined_matches);
+    }
+
+    combined_matches
 }

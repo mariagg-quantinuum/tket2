@@ -58,6 +58,8 @@ pub mod subcircuit;
 
 #[cfg(feature = "portmatching")]
 pub mod portmatching;
+#[cfg(feature = "badgerv2_unstable")]
+pub mod rewrite_space;
 
 #[cfg(feature = "llvm")]
 pub mod llvm;
@@ -68,3 +70,4 @@ pub use circuit::{Circuit, CircuitError, CircuitMutError};
 pub use hugr;
 pub use hugr::Hugr;
 pub use ops::{op_matches, symbolic_constant_op, Pauli, TketOp};
+pub use subcircuit::Subcircuit;

@@ -1,16 +1,23 @@
 //! PyO3 wrapper for rewriters.
 
 use derive_more::From;
-use hugr::HugrView;
+use hugr::persistent::{Commit, PatchNode};
+use hugr::{hugr::views::SiblingSubgraph, HugrView, Node, SimpleReplacement};
 use itertools::Itertools;
 use pyo3::prelude::*;
 use std::path::PathBuf;
+use tket::rewrite::matcher::CachedWalker;
+use tket::rewrite::RewriteName;
 use tket::{
-    rewrite::{CircuitRewrite, ECCRewriter, Rewriter, Subcircuit},
+    resource::ResourceScope,
+    rewrite::{CircuitRewrite, ECCRewriter, Rewriter},
     Circuit,
 };
 
-use crate::circuit::{PyNode, Tk2Circuit};
+use crate::{
+    circuit::{PyNode, Tk2Circuit},
+    matcher::{PyCombineMatchReplaceRewriter, PyMatchReplaceRewriter},
+};
 
 /// The module definition
 pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
@@ -32,7 +39,7 @@ pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
 #[repr(transparent)]
 pub struct PyCircuitRewrite {
     /// Rust representation of the circuit chunks.
-    pub rewrite: CircuitRewrite,
+    pub rewrite: SimpleReplacement,
 }
 
 #[pymethods]
@@ -42,12 +49,14 @@ impl PyCircuitRewrite {
     /// The difference between the new number of nodes minus the old. A positive
     /// number is an increase in node count, a negative number is a decrease.
     pub fn node_count_delta(&self) -> isize {
-        self.rewrite.node_count_delta()
+        let old_count = self.rewrite.subgraph().node_count() as isize;
+        let new_count = Circuit::new(self.rewrite.replacement()).num_operations() as isize;
+        new_count - old_count
     }
 
     /// The replacement subcircuit.
     pub fn replacement(&self) -> Tk2Circuit {
-        self.rewrite.replacement().to_owned().into()
+        Circuit::new(self.rewrite.replacement().to_owned()).into()
     }
 
     #[new]
@@ -56,13 +65,14 @@ impl PyCircuitRewrite {
         source_circ: PyRef<Tk2Circuit>,
         replacement: Tk2Circuit,
     ) -> PyResult<Self> {
+        let repl = SimpleReplacement::try_new(
+            source_position.0,
+            source_circ.circ.hugr(),
+            replacement.circ.into_hugr(),
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         Ok(Self {
-            rewrite: CircuitRewrite::try_new(
-                &source_position.0,
-                &source_circ.circ,
-                replacement.circ,
-            )
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            rewrite: repl.into(),
         })
     }
 }
@@ -75,20 +85,129 @@ impl PyCircuitRewrite {
 pub enum PyRewriter {
     /// A rewriter based on circuit equivalence classes.
     ECC(PyECCRewriter),
+    /// A rewriter based on a matcher and replacer.
+    MatchReplace(PyMatchReplaceRewriter),
+    /// A rewriter based on a combination of matchers and replacers.
+    CombineMatchReplace(PyCombineMatchReplaceRewriter),
     /// A rewriter based on a list of rewriters.
     Vec(Vec<PyRewriter>),
 }
 
-impl Rewriter for PyRewriter {
+impl<H: HugrView<Node = Node>> Rewriter<ResourceScope<H>> for PyRewriter {
+    type Rewrite = CircuitRewrite;
+
     fn get_rewrites(
         &self,
-        circ: &Circuit<impl HugrView<Node = hugr::Node>>,
-    ) -> Vec<CircuitRewrite> {
+        circ: &ResourceScope<H>,
+        root_node: H::Node,
+    ) -> Vec<CircuitRewrite<H::Node>> {
         match self {
-            Self::ECC(ecc) => ecc.0.get_rewrites(circ),
+            Self::ECC(ecc) => ecc.0.get_rewrites(circ, root_node),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<ResourceScope<H>>::get_rewrites(rewriter, circ, root_node)
+            }
+            Self::CombineMatchReplace(rewriter) => {
+                Rewriter::<ResourceScope<H>>::get_rewrites(rewriter, circ, root_node)
+            }
             Self::Vec(rewriters) => rewriters
                 .iter()
-                .flat_map(|r| r.get_rewrites(circ))
+                .flat_map(|r| r.get_rewrites(circ, root_node))
+                .collect(),
+        }
+    }
+
+    fn get_all_rewrites(&self, circ: &ResourceScope<H>) -> Vec<CircuitRewrite<H::Node>> {
+        match self {
+            Self::ECC(ecc) => ecc.0.get_all_rewrites(circ),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<ResourceScope<H>>::get_all_rewrites(rewriter, circ)
+            }
+            Self::CombineMatchReplace(rewriter) => {
+                Rewriter::<ResourceScope<H>>::get_all_rewrites(rewriter, circ)
+            }
+            Self::Vec(rewriters) => rewriters
+                .iter()
+                .flat_map(|r| r.get_all_rewrites(circ))
+                .collect(),
+        }
+    }
+}
+
+/*impl<'c, C> Rewriter<&'c RewriteSpace<C>> for PyRewriter {
+    type Rewrite = (Commit<'c>, RewriteName);
+
+    fn get_rewrites(
+        &self,
+        circ: &&'c RewriteSpace<C>,
+        root_node: PatchNode,
+    ) -> Vec<(Commit<'c>, RewriteName)> {
+        match self {
+            Self::ECC(..) => unimplemented!("no support for ECC rewriters in seadog yet"),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<&'c RewriteSpace<C>>::get_rewrites(rewriter, circ, root_node)
+            }
+            Self::CombineMatchReplace(..) => {
+                unimplemented!("no support for combine match replace rewriters in seadog yet")
+            }
+            Self::Vec(rewriters) => rewriters
+                .iter()
+                .flat_map(|r| r.get_rewrites(circ, root_node))
+                .collect(),
+        }
+    }
+
+    fn get_all_rewrites(&self, circ: &&'c RewriteSpace<C>) -> Vec<(Commit<'c>, RewriteName)> {
+        match self {
+            Self::ECC(..) => unimplemented!("no support for ECC rewriters in seadog yet"),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<&'c RewriteSpace<C>>::get_all_rewrites(rewriter, circ)
+            }
+            Self::CombineMatchReplace(..) => {
+                unimplemented!("no support for combine match replace rewriters in seadog yet")
+            }
+            Self::Vec(rewriters) => rewriters
+                .iter()
+                .flat_map(|r| r.get_all_rewrites(circ))
+                .collect(),
+        }
+    }
+}*/
+
+impl<'c> Rewriter<CachedWalker<'c>> for PyRewriter {
+    type Rewrite = (Commit<'c>, RewriteName);
+
+    fn get_rewrites(
+        &self,
+        circ: &CachedWalker<'c>,
+        root_node: PatchNode,
+    ) -> Vec<(Commit<'c>, RewriteName)> {
+        match self {
+            Self::ECC(..) => unimplemented!("no support for ECC rewriters in seadog yet"),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<CachedWalker<'c>>::get_rewrites(rewriter, circ, root_node)
+            }
+            Self::CombineMatchReplace(..) => {
+                unimplemented!("no support for combine match replace rewriters in seadog yet")
+            }
+            Self::Vec(rewriters) => rewriters
+                .iter()
+                .flat_map(|r| r.get_rewrites(circ, root_node))
+                .collect(),
+        }
+    }
+
+    fn get_all_rewrites(&self, circ: &CachedWalker<'c>) -> Vec<(Commit<'c>, RewriteName)> {
+        match self {
+            Self::ECC(..) => unimplemented!("no support for ECC rewriters in seadog yet"),
+            Self::MatchReplace(rewriter) => {
+                Rewriter::<CachedWalker<'c>>::get_all_rewrites(rewriter, circ)
+            }
+            Self::CombineMatchReplace(..) => {
+                unimplemented!("no support for combine match replace rewriters in seadog yet")
+            }
+            Self::Vec(rewriters) => rewriters
+                .iter()
+                .flat_map(|r| r.get_all_rewrites(circ))
                 .collect(),
         }
     }
@@ -103,7 +222,7 @@ impl Rewriter for PyRewriter {
 #[pyo3(name = "Subcircuit")]
 #[derive(Debug, Clone, From)]
 #[repr(transparent)]
-pub struct PySubcircuit(Subcircuit);
+pub struct PySubcircuit(SiblingSubgraph);
 
 #[pymethods]
 impl PySubcircuit {
@@ -111,7 +230,7 @@ impl PySubcircuit {
     fn from_nodes(nodes: Vec<PyNode>, circ: &Tk2Circuit) -> PyResult<Self> {
         let nodes: Vec<_> = nodes.into_iter().map_into().collect();
         Ok(Self(
-            Subcircuit::try_from_nodes(nodes, &circ.circ)
+            SiblingSubgraph::try_from_nodes(nodes, circ.circ.hugr())
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
         ))
     }
@@ -144,12 +263,16 @@ impl PyECCRewriter {
         )?))
     }
 
-    /// Returns a list of circuit rewrites that can be applied to the given Tk2Circuit.
+    /// Returns a list of circuit rewrites that can be applied to the given
+    /// Tk2Circuit.
     pub fn get_rewrites(&self, circ: &Tk2Circuit) -> Vec<PyCircuitRewrite> {
         self.0
-            .get_rewrites(&circ.circ)
+            .get_all_rewrites(&circ.circ)
             .into_iter()
-            .map_into()
+            .map(|r| match r {
+                CircuitRewrite::New { .. } => unimplemented!(),
+                CircuitRewrite::Old(rewrite) => SimpleReplacement::from(rewrite).into(),
+            })
             .collect()
     }
 }

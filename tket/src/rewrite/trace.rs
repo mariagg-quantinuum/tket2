@@ -2,8 +2,10 @@
 //!
 //! This is only tracked if the `rewrite-tracing` feature is enabled.
 
+use hugr::core::HugrNode;
 use hugr::hugr::hugrmut::HugrMut;
 use hugr::hugr::NodeMetadata;
+use hugr::HugrView;
 use itertools::Itertools;
 
 use crate::Circuit;
@@ -33,9 +35,9 @@ pub struct RewriteTrace {
     individual_matches: u16,
 }
 
-impl From<&CircuitRewrite> for RewriteTrace {
+impl<N: HugrNode> From<&CircuitRewrite<N>> for RewriteTrace {
     #[inline]
-    fn from(_rewrite: &CircuitRewrite) -> Self {
+    fn from(_rewrite: &CircuitRewrite<N>) -> Self {
         // NOTE: We don't currently track any actual information about the rewrite.
         Self {
             individual_matches: 1,
@@ -108,7 +110,9 @@ impl<T: HugrMut> Circuit<T> {
             None => false,
         }
     }
+}
 
+impl<T: HugrView> Circuit<T> {
     /// Returns the traces of rewrites applied to the circuit.
     ///
     /// Returns `None` if rewrite tracing is not enabled for this circuit.

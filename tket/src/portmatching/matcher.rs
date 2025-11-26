@@ -9,11 +9,14 @@ use std::{
 
 use super::{CircuitPattern, NodeID, PEdge, PNode};
 use derive_more::{Display, Error, From};
-use hugr::hugr::views::sibling_subgraph::{
-    InvalidReplacement, InvalidSubgraph, InvalidSubgraphBoundary, TopoConvexChecker,
-};
 use hugr::hugr::views::SiblingSubgraph;
 use hugr::ops::OpType;
+use hugr::{
+    hugr::views::sibling_subgraph::{
+        InvalidReplacement, InvalidSubgraph, InvalidSubgraphBoundary, TopoConvexChecker,
+    },
+    SimpleReplacement,
+};
 use hugr::{HugrView, IncomingPort, Node, OutgoingPort, Port, PortIndex};
 use itertools::Itertools;
 use portmatching::{
@@ -22,10 +25,7 @@ use portmatching::{
 };
 use smol_str::SmolStr;
 
-use crate::{
-    circuit::Circuit,
-    rewrite::{CircuitRewrite, Subcircuit},
-};
+use crate::{circuit::Circuit, rewrite::CircuitRewrite};
 
 /// Matchable operations in a circuit.
 #[derive(
@@ -75,7 +75,8 @@ fn encode_op(op: OpType) -> Option<Vec<u8>> {
 /// pattern from the matcher.
 #[derive(Clone)]
 pub struct PatternMatch {
-    position: Subcircuit,
+    /// The matched subgraph.
+    subgraph: SiblingSubgraph,
     pattern: PatternID,
     /// The root of the pattern in the circuit.
     ///
@@ -96,13 +97,13 @@ impl PatternMatch {
     }
 
     /// Returns the matched subcircuit in the original circuit.
-    pub fn subcircuit(&self) -> &Subcircuit {
-        &self.position
+    pub fn subgraph(&self) -> &SiblingSubgraph {
+        &self.subgraph
     }
 
     /// Returns the matched nodes in the original circuit.
     pub fn nodes(&self) -> &[Node] {
-        self.position.nodes()
+        self.subgraph.nodes()
     }
 
     /// Create a pattern match from the image of a pattern root.
@@ -205,7 +206,7 @@ impl PatternMatch {
         let subgraph =
             SiblingSubgraph::try_new_with_checker(inputs, outputs, circ.hugr(), checker)?;
         Ok(Self {
-            position: subgraph.into(),
+            subgraph,
             pattern,
             root,
         })
@@ -217,7 +218,14 @@ impl PatternMatch {
         source: &Circuit<impl HugrView<Node = Node>>,
         target: Circuit,
     ) -> Result<CircuitRewrite, InvalidReplacement> {
-        CircuitRewrite::try_new(&self.position, source, target)
+        Ok(
+            SimpleReplacement::try_new(
+                self.subgraph.to_owned(),
+                source.hugr(),
+                target.into_hugr(),
+            )?
+            .into(),
+        )
     }
 }
 
@@ -225,7 +233,7 @@ impl Debug for PatternMatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PatternMatch")
             .field("root", &self.root)
-            .field("nodes", &self.position.subgraph.nodes())
+            .field("nodes", &self.subgraph.nodes())
             .finish()
     }
 }
@@ -286,7 +294,7 @@ impl PatternMatcher {
     }
 
     /// Find all convex pattern matches in a circuit rooted at a given node.
-    fn find_rooted_matches<H: HugrView<Node = Node>>(
+    pub fn find_rooted_matches<H: HugrView<Node = Node>>(
         &self,
         circ: &Circuit<H>,
         root: Node,

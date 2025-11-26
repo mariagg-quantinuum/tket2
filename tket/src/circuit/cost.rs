@@ -15,7 +15,8 @@ pub trait CircuitCost: Add<Output = Self> + Sum<Self> + Debug + Default + Clone 
     /// The cost delta between two costs.
     type CostDelta: CostDelta;
 
-    /// Return the cost as a `usize`. This may discard some of the cost information.
+    /// Return the cost as a `usize`. This may discard some of the cost
+    /// information.
     fn as_usize(&self) -> usize;
 
     /// Return the cost delta between two costs.
@@ -32,7 +33,8 @@ pub trait CircuitCost: Add<Output = Self> + Sum<Self> + Debug + Default + Clone 
 pub trait CostDelta:
     AddAssign + Add<Output = Self> + Sum<Self> + Debug + Default + Clone + Ord
 {
-    /// Return the delta as a `isize`. This may discard some of the cost delta information.
+    /// Return the delta as a `isize`. This may discard some of the cost delta
+    /// information.
     fn as_isize(&self) -> isize;
 }
 
@@ -72,6 +74,84 @@ impl<const N: usize> serde::Serialize for LexicographicCost<usize, N> {
         S: serde::Serializer,
     {
         serializer.serialize_str(&format!("{self:?}"))
+    }
+}
+
+// Serialise as string so that it is easy to write to CSV
+impl<const N: usize> serde::Serialize for LexicographicCost<isize, N> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{self:?}"))
+    }
+}
+
+impl<'de, const N: usize> serde::Deserialize<'de> for LexicographicCost<isize, N> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut s = String::deserialize(deserializer)?;
+        s = s.trim().to_string();
+        s = s.strip_prefix('[').unwrap_or(&s).to_string();
+        s = s.strip_suffix(']').unwrap_or(&s).to_string();
+
+        let values: Vec<isize> = s
+            .split(',')
+            .map(|x| x.trim().parse().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if values.len() != N {
+            return Err(serde::de::Error::custom(format!(
+                "Expected {} values, got {}",
+                N,
+                values.len()
+            )));
+        }
+
+        let mut cost_array = [0isize; N];
+        for (i, &value) in values.iter().enumerate() {
+            cost_array[i] = value;
+        }
+
+        let cost = LexicographicCost(cost_array);
+
+        Ok(cost)
+    }
+}
+
+impl<'de, const N: usize> serde::Deserialize<'de> for LexicographicCost<usize, N> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut s = String::deserialize(deserializer)?;
+        s = s.trim().to_string();
+        s = s.strip_prefix('[').unwrap_or(&s).to_string();
+        s = s.strip_suffix(']').unwrap_or(&s).to_string();
+
+        let values: Vec<usize> = s
+            .split(',')
+            .map(|x| x.trim().parse().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if values.len() != N {
+            return Err(serde::de::Error::custom(format!(
+                "Expected {} values, got {}",
+                N,
+                values.len()
+            )));
+        }
+
+        let mut cost_array = [0usize; N];
+        for (i, &value) in values.iter().enumerate() {
+            cost_array[i] = value;
+        }
+
+        let cost = LexicographicCost(cost_array);
+
+        Ok(cost)
     }
 }
 
@@ -251,7 +331,7 @@ mod tests {
 
     #[test]
     fn serde_serialize() {
-        let a = LexicographicCost([10, 2]);
+        let a: LexicographicCost<usize, 2> = LexicographicCost([10, 2]);
         let s = serde_json::to_string(&a).unwrap();
         assert_eq!(s, "\"[10, 2]\"");
     }

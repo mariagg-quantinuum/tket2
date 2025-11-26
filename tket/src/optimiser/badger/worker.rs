@@ -3,9 +3,8 @@
 use std::thread::{self, JoinHandle};
 
 use crate::circuit::CircuitHash;
-use crate::rewrite::strategy::RewriteStrategy;
-use crate::rewrite::Rewriter;
-use crate::{circuit::cost::CircuitCost, Circuit};
+use crate::optimiser::badger::{BadgerRewriteStrategy, BadgerRewriter};
+use crate::{circuit::cost::CircuitCost, resource::ResourceScope};
 
 use super::pqueue_worker::{StatePQueueChannels, Work};
 
@@ -15,7 +14,7 @@ pub struct BadgerWorker<R, S, P: Ord> {
     #[allow(unused)]
     id: usize,
     /// The channel to send and receive work from.
-    priority_channel: StatePQueueChannels<Circuit, P>,
+    priority_channel: StatePQueueChannels<ResourceScope, P>,
     /// The rewriter to use.
     rewriter: R,
     /// The rewrite strategy to use.
@@ -24,15 +23,15 @@ pub struct BadgerWorker<R, S, P: Ord> {
 
 impl<R, S, P> BadgerWorker<R, S, P>
 where
-    R: Rewriter + Send + 'static,
-    S: RewriteStrategy<Cost = P> + Send + 'static,
+    R: BadgerRewriter,
+    S: BadgerRewriteStrategy<Cost = P>,
     P: CircuitCost + Send + Sync + 'static,
 {
     /// Spawn a new worker thread.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: usize,
-        priority_channel: StatePQueueChannels<Circuit, P>,
+        priority_channel: StatePQueueChannels<ResourceScope, P>,
         rewriter: R,
         strategy: S,
     ) -> JoinHandle<()> {
@@ -65,7 +64,7 @@ where
                 break;
             };
 
-            let rewrites = self.rewriter.get_rewrites(&circ);
+            let rewrites = self.rewriter.get_all_rewrites(&circ);
             let max_cost = self.priority_channel.max_cost();
             let new_circs = self
                 .strategy

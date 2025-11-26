@@ -4,6 +4,10 @@
 //! copyable values throughout a HUGR circuit, including resource identifiers,
 //! positions, and the mapping structures that associate them with operations.
 
+use std::ops::RangeInclusive;
+
+use cgmath::Zero;
+use derive_more::derive::From;
 use hugr::{
     core::HugrNode, types::Signature, Direction, IncomingPort, OutgoingPort, Port, PortIndex, Wire,
 };
@@ -21,8 +25,14 @@ pub struct ResourceId(usize);
 impl ResourceId {
     /// Create a new ResourceId.
     ///
+<<<<<<< HEAD
+    /// ResourceIds should typically be obtained from [`ResourceAllocator`].
+    /// Only use this in testing.
+    pub(super) fn new(id: usize) -> Self {
+=======
     /// This method should only be called by ResourceAllocator and tests.
     pub(crate) fn new(id: usize) -> Self {
+>>>>>>> pr-1269
         Self(id)
     }
 
@@ -38,7 +48,7 @@ impl ResourceId {
 /// Initially assigned as contiguous integers, they may become non-integer
 /// when operations are inserted or removed.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Position(Rational64);
+pub struct Position(pub(crate) Rational64);
 
 impl std::fmt::Debug for Position {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,8 +61,8 @@ impl Position {
     ///
     /// This method should only be called by allocators and tests.
     #[allow(unused)]
-    pub(super) fn new_integer(i: i64) -> Self {
-        Self(Rational64::from_integer(i))
+    pub(super) fn new_integer(numer: i64) -> Self {
+        Self(Rational64::from_integer(numer))
     }
 
     /// Get position as f64, rounded to the given precision.
@@ -65,19 +75,71 @@ impl Position {
     pub fn increment(&self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// Rescale the position such that any number in the old range (including
+    /// ends) is within the new range (excluding ends).
+    pub(crate) fn rescale(
+        &self,
+        old_range: RangeInclusive<Position>,
+        new_range: RangeInclusive<Position>,
+    ) -> Self {
+        let Self(pos) = self;
+        let old_range_size = Rational64::from_integer(2) + old_range.end().0 - old_range.start().0;
+        let new_range_size = new_range.end().0 - new_range.start().0;
+
+        if old_range_size == Rational64::zero() {
+            return *new_range.start();
+        }
+
+        let new_pos = new_range.start().0
+            + (Rational64::from_integer(1) + pos - old_range.start().0) / old_range_size
+                * new_range_size;
+        Self(new_pos)
+    }
 }
 
 /// A value associated with a dataflow port, identified either by a resource ID
 /// (for linear values) or by its wire (for copyable values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// This can currently be converted to and from [`hugr::CircuitUnit`], but
+/// linear wires are assigned to resources with typed resource IDs instead of
+/// integers.
+///
+/// Equivalence with [`hugr::CircuitUnit`] is not guaranteed in the future: we
+/// may expand expressivity, e.g. identifying copyable units by their ASTs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From)]
 pub enum CircuitUnit<N: HugrNode> {
     /// A linear resource.
-    Resource(ResourceId),
+    Resource(#[from] ResourceId),
     /// A copyable value.
-    Copyable(Wire<N>),
+    Copyable(#[from] Wire<N>),
 }
 
 impl<N: HugrNode> CircuitUnit<N> {
+    /// Map the node IDs in copyable values.
+    pub(super) fn map_node<N2: HugrNode>(self, map_fn: impl FnOnce(N) -> N2) -> CircuitUnit<N2> {
+        match self {
+            CircuitUnit::Resource(resource_id) => CircuitUnit::Resource(resource_id),
+            CircuitUnit::Copyable(wire) => {
+                CircuitUnit::Copyable(Wire::new(map_fn(wire.node()), wire.source()))
+            }
+        }
+    }
+
+    /// Map the node IDs and ports in copyable values.
+    pub(super) fn map_node_port<N2: HugrNode>(
+        self,
+        map_fn: impl FnOnce(N, OutgoingPort) -> (N2, OutgoingPort),
+    ) -> CircuitUnit<N2> {
+        match self {
+            CircuitUnit::Resource(resource_id) => CircuitUnit::Resource(resource_id),
+            CircuitUnit::Copyable(wire) => {
+                let (node, port) = map_fn(wire.node(), wire.source());
+                CircuitUnit::Copyable(Wire::new(node, port))
+            }
+        }
+    }
+
     /// Returns true if this is a resource value.
     pub fn is_resource(&self) -> bool {
         matches!(self, CircuitUnit::Resource(..))
@@ -145,6 +207,13 @@ impl<T> PortMap<T> {
         Self {
             vec: vec![default; num_inputs + num_outputs],
             num_inputs,
+        }
+    }
+
+    pub(super) fn map<U>(self, mut map_fn: impl FnMut(T) -> U) -> PortMap<U> {
+        PortMap {
+            vec: self.vec.into_iter().map(|t| map_fn(t)).collect(),
+            num_inputs: self.num_inputs,
         }
     }
 

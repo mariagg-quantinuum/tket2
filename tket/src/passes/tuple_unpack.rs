@@ -5,13 +5,13 @@ use core::panic;
 use hugr::builder::{DFGBuilder, Dataflow, DataflowHugr};
 use hugr::extension::prelude::{MakeTuple, TupleOpDef};
 use hugr::extension::simple_op::MakeExtensionOp;
+use hugr::hugr::views::SiblingSubgraph;
 use hugr::ops::{OpTrait, OpType};
 use hugr::types::Type;
-use hugr::{HugrView, Node};
+use hugr::{HugrView, Node, SimpleReplacement};
 use itertools::Itertools;
 
 use crate::circuit::Command;
-use crate::rewrite::{CircuitRewrite, Subcircuit};
 use crate::Circuit;
 
 /// Find tuple pack operations followed by tuple unpack operations
@@ -19,7 +19,7 @@ use crate::Circuit;
 #[deprecated(since = "0.15.1", note = "Use hugr::algorithms::UntuplePass instead")]
 pub fn find_tuple_unpack_rewrites(
     circ: &Circuit<impl HugrView<Node = Node>>,
-) -> impl Iterator<Item = CircuitRewrite> + '_ {
+) -> impl Iterator<Item = SimpleReplacement> + '_ {
     circ.commands().filter_map(|cmd| make_rewrite(circ, cmd))
 }
 
@@ -40,7 +40,7 @@ fn is_unpack_tuple(optype: &OpType) -> bool {
 fn make_rewrite<T: HugrView<Node = Node>>(
     circ: &Circuit<T>,
     cmd: Command<T>,
-) -> Option<CircuitRewrite> {
+) -> Option<SimpleReplacement> {
     let cmd_optype = cmd.optype();
     let tuple_node = cmd.node();
     if !is_make_tuple(cmd_optype) {
@@ -97,13 +97,13 @@ fn remove_pack_unpack<T: HugrView<Node = Node>>(
     pack_node: Node,
     unpack_nodes: Vec<Node>,
     num_other_outputs: usize,
-) -> CircuitRewrite {
+) -> SimpleReplacement {
     let num_unpack_outputs = tuple_types.len() * unpack_nodes.len();
 
     let mut nodes = unpack_nodes;
     nodes.push(pack_node);
-    let subcirc = Subcircuit::try_from_nodes(nodes, circ).unwrap();
-    let subcirc_signature = subcirc.signature(circ);
+    let subgraph = SiblingSubgraph::try_from_nodes(nodes, circ.hugr()).expect("is convex");
+    let subcirc_signature = subgraph.signature(circ.hugr());
 
     // The output port order in `Subcircuit::try_from_nodes` is not too well defined.
     // Check that the outputs are in the expected order.
@@ -142,11 +142,10 @@ fn remove_pack_unpack<T: HugrView<Node = Node>>(
         .finish_hugr_with_outputs(outputs)
         .unwrap_or_else(|e| {
             panic!("Failed to create replacement for removing tuple pack/unpack operations. {e}")
-        })
-        .into();
+        });
 
-    subcirc
-        .create_rewrite(circ, replacement)
+    subgraph
+        .create_simple_replacement(circ.hugr(), replacement)
         .unwrap_or_else(|e| {
             panic!("Failed to create rewrite for removing tuple pack/unpack operations. {e}")
         })
@@ -157,6 +156,7 @@ mod test {
     use super::*;
     use hugr::extension::prelude::{bool_t, qb_t, UnpackTuple};
 
+    use hugr::hugr::Patch;
     use hugr::types::Signature;
     use rstest::{fixture, rstest};
 
@@ -245,7 +245,7 @@ mod test {
                 break;
             };
             num_rewrites += 1;
-            rewrite.apply(&mut circ)?;
+            rewrite.apply(circ.hugr_mut())?;
         }
         assert_eq!(num_rewrites, expected_rewrites);
 
