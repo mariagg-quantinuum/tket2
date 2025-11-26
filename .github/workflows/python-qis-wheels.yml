@@ -1,4 +1,4 @@
-name: Build qis-compiler wheels Release
+name: Python wheels 🐍 (qis-compiler)
 
 on:
   push:
@@ -7,6 +7,11 @@ on:
   release:
     types:
       - published
+  pull_request:
+    # check builds work if qis-compiler build config changes
+    paths:
+      - "qis-compiler/pyproject.toml"
+      - ".github/workflows/python-qis-wheels.yml"
   workflow_dispatch:
 
 permissions:
@@ -16,18 +21,34 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CACHE_CARGO: true
-  UV_VERSION: "0.8.22"
+  UV_VERSION: "0.9.7"
 jobs:
+  # Check if the tag matches the package name,
+  # or if the workflow is running on a non-release event.
+  check-tag:
+    name: Check tag
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check-tag.outputs.run }}
+    steps:
+      - name: Check tag
+        id: check-tag
+        run: |
+          echo "run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+        env:
+          SHOULD_RUN: ${{ github.event_name != 'release' || ( github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/qis-compiler-v') ) }}
+
   build_qis_compiler_wheels:
+    needs: check-tag
+    if: ${{ needs.check-tag.outputs.run == 'true' }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
           - ubuntu-24.04-arm
-          - macos-14
-          # macos-13 runners are being retired, re-enable if needed
-          # - macos-13
+          - macos-15
+          - macos-15-intel
           - windows-2022
     name: "qis-compiler wheels (${{matrix.os}})"
     runs-on: ${{ matrix.os }}
@@ -36,12 +57,11 @@ jobs:
       # Bootstrap the build environment
       # ---------------------------------
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Set up UV
-        if: ${{ matrix.os != 'ubuntu-latest' }}
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -64,75 +84,42 @@ jobs:
       # /tmp/ci-cache for caching, which is then accessed as
       # /host/tmp/ci-cache within the container.
 
-
       # if the hugr_qis compiler has changed, we build it.
       - name: Build selene-hugr-qis-compiler wheel
-        uses: pypa/cibuildwheel@v3.2.0
+        uses: pypa/cibuildwheel@v3.2.1
         with:
           package-dir: qis-compiler
 
+      - name: Check built wheels
+        run: uvx twine check --strict wheelhouse/*.whl
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: qis-compiler-wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
           if-no-files-found: error
 
   release:
-    strategy:
-      matrix:
-        target:
-          - name: selene-hugr-qis-compiler
-            upload: wheelhouse/selene_hugr_qis_compiler-*.whl
-
-    name: Release ${{ matrix.target.name }}
+    name: Release qis-compiler
+    needs: [check-tag, build_qis_compiler_wheels]
+    if: ${{ needs.check-tag.outputs.run == 'true' && github.event_name == 'release' }}
     runs-on: ubuntu-latest
     # always do a full build and test before release of any package
-    needs: [build_qis_compiler_wheels]
     environment: release
     permissions:
       contents: write
       # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
     steps:
-      # note: we can't use if: on the entire job, as if statements are evaluated
-      # before matrix expansion, so we follow the convention of guppylang and
-      # use a step to check if we should run the release job
-      - name: Check tag
-        id: check-tag
-        run: |
-          echo "run=$SHOULD_RUN" >> $GITHUB_OUTPUT
-        env:
-          SHOULD_RUN: ${{ github.ref_type == 'tag' && startsWith(github.ref, format('refs/tags/{0}-v', matrix.target.name)) }}
-
       - uses: actions/download-artifact@v5
-        if: ${{ steps.check-tag.outputs.run == 'true' }}
         with:
           path: wheelhouse
           merge-multiple: true
 
-      - name: Setup Python
-        if: ${{ steps.check-tag.outputs.run == 'true' }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: 3.12
-
-      - name: Install twine
-        if: ${{ steps.check-tag.outputs.run == 'true' }}
-        run: python -m pip install twine
-
-      - name: Upload to jfrog
-        if: ${{ steps.check-tag.outputs.run == 'true' }}
-        run: |
-          twine upload --verbose --non-interactive ${{ matrix.target.upload }}
-        env:
-          TWINE_REPOSITORY_URL: ${{ secrets.JFROG_URL }}
-          TWINE_USERNAME: ${{ secrets.JFROG_USER }}
-
-      - name: Publish package distributions to PyPIz
-        if: ${{ steps.check-tag.outputs.run == 'true' }}
+      - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
           skip-existing: true
+          packages-dir: wheelhouse

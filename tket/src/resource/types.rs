@@ -25,9 +25,14 @@ pub struct ResourceId(usize);
 impl ResourceId {
     /// Create a new ResourceId.
     ///
+<<<<<<< HEAD
     /// ResourceIds should typically be obtained from [`ResourceAllocator`].
     /// Only use this in testing.
     pub(super) fn new(id: usize) -> Self {
+=======
+    /// This method should only be called by ResourceAllocator and tests.
+    pub(crate) fn new(id: usize) -> Self {
+>>>>>>> pr-1269
         Self(id)
     }
 

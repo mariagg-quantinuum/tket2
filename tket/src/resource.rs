@@ -45,6 +45,7 @@
 
 // Public API exports
 pub use flow::{DefaultResourceFlow, ResourceFlow, UnsupportedOp};
+<<<<<<< HEAD
 use hugr::{
     extension::simple_op::MakeExtensionOp,
     hugr::{hugrmut::HugrMut, views::NodesIter},
@@ -55,6 +56,9 @@ use hugr::{
 pub use interval::{Interval, InvalidInterval};
 use itertools::Itertools;
 pub use scope::{CircuitRewriteError, ResourceScope, ResourceScopeConfig};
+=======
+pub use scope::{ResourceScope, ResourceScopeConfig};
+>>>>>>> pr-1269
 pub use types::{CircuitUnit, Position, ResourceAllocator, ResourceId};
 
 use crate::{
@@ -66,7 +70,6 @@ use crate::{
 // Internal modules
 mod convex_checker;
 mod flow;
-mod interval;
 mod scope;
 mod types;
 

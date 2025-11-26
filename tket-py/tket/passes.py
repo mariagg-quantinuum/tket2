@@ -1,18 +1,35 @@
 from pathlib import Path
 from typing import Optional, Literal
+import json
+from dataclasses import dataclass
 
 from pytket import Circuit
-from pytket.passes import CustomPass, BasePass
+from pytket.passes import (
+    CustomPass,
+    BasePass,
+)
 
 from tket import optimiser
+from tket.circuit import Tk2Circuit
 
-# Re-export native bindings
+from hugr.passes._composable_pass import (
+    ComposablePass,
+    implement_pass_run,
+    PassResult,
+)
+
+
+from hugr.hugr.base import Hugr
+
+# Re-export native bindings.
 from ._tket.passes import (
     CircuitChunks,
     greedy_depth_reduce,
     lower_to_pytket,
     badger_optimise,
     chunks,
+    tket1_pass,
+    normalize_guppy,
     PullForwardError,
 )
 
@@ -25,6 +42,7 @@ __all__ = [
     "lower_to_pytket",
     "badger_optimise",
     "chunks",
+    "normalize_guppy",
     "PullForwardError",
 ]
 
@@ -76,3 +94,38 @@ def badger_pass(
         )
 
     return CustomPass(apply, label="tket.badger_pass")
+
+
+@dataclass
+class PytketPass(ComposablePass):
+    pytket_pass: BasePass
+
+    """
+    A class which provides an interface to apply pytket passes to Hugr programs.
+
+    The user can create a :py:class:`PytketPass` object from any serializable member of `pytket.passes`.
+    """
+
+    def __init__(self, pytket_pass: BasePass) -> None:
+        """Initialize a PytketPass from a :py:class:`~pytket.passes.BasePass` instance."""
+        self.pytket_pass = pytket_pass
+
+    def __call__(self, hugr: Hugr, *, inplace: bool = False) -> Hugr:
+        """Call the pytket pass to transform a HUGR, returning a Hugr."""
+        return self.run(hugr, inplace=inplace).hugr
+
+    def run(self, hugr: Hugr, *, inplace: bool = False) -> PassResult:
+        """Run the pytket pass as a HUGR transform returning a PassResult."""
+        return implement_pass_run(
+            self,
+            hugr=hugr,
+            inplace=inplace,
+            copy_call=lambda h: self._run_pytket_pass_on_hugr(h),
+        )
+
+    def _run_pytket_pass_on_hugr(self, hugr: Hugr) -> PassResult:
+        pass_json = json.dumps(self.pytket_pass.to_dict())
+        compiler_state: Tk2Circuit = Tk2Circuit.from_bytes(hugr.to_bytes())
+        opt_program = tket1_pass(compiler_state, pass_json, traverse_subcircuits=True)
+        new_hugr = Hugr.from_str(opt_program.to_str())
+        return PassResult(hugr=new_hugr, inplace=False)

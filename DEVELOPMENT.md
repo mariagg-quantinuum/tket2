@@ -30,13 +30,26 @@ To setup the environment manually you will need:
 
 - Just: <https://just.systems/>
 - Rust `>=1.85`: <https://www.rust-lang.org/tools/install>
+- cargo-nextest: <https://nexte.st/docs/installation/pre-built-binaries/>
 - uv `>=0.3`: docs.astral.sh/uv/getting-started/installation
+- conan `>=2.0.0,<3`: This gets installed by `just setup` / `uv tool install conan`
+- Optional: llvm `== 14.0`. The "llvm" feature (backed by the sub-crate `hugr-llvm`)
+  requires LLVM installed. We use the rust bindings
+  [llvm-sys](https://crates.io/crates/llvm-sys) to [llvm](https://llvm.org/).
 
 Once you have these installed, install the required python dependencies and setup pre-commit hooks with:
 
 ```bash
 just setup
 ```
+
+#### Note on LLVM
+
+You will need llvm 14.0 installed in order for `just check` to run all its
+checks successfully. On Debian-based systems you can install it as the
+`llvm-14` package; you will also need to install `libpolly14-dev`. You should
+set the environment variable `LLVM_SYS_140_PREFIX` to point to its location
+(e.g. `/usr/lib/llvm-14`) when running `just check`.
 
 ## 🚀 Local development using the tket python library
 
@@ -63,8 +76,8 @@ To compile and test the code, run:
 ```bash
 just test
 # or, to test only the rust code or the python code
-just test rust
-just test python
+just test-rust
+just test-python
 ```
 
 Run `just` to see all available commands.
@@ -90,8 +103,8 @@ To quickly fix common issues, run:
 ```bash
 just fix
 # or, to fix only the rust code or the python code
-just fix rust
-just fix python
+just fix-rust
+just fix-python
 ```
 
 ## 📈 Code Coverage
@@ -126,7 +139,7 @@ your PR mark it with a 'run-ci-checks' label and push new commits to it.
 
 The general format of a contribution title should be:
 
-```
+```text
 <type>(<scope>)!: <description>
 ```
 

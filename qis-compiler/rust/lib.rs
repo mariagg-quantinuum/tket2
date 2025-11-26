@@ -53,6 +53,8 @@ use tket_qsystem::llvm::{
 use tracing::{Level, event, instrument};
 use utils::read_hugr_envelope;
 
+mod gpu;
+mod selene_specific;
 mod utils;
 
 const LLVM_MAIN: &str = "qmain";
@@ -71,6 +73,7 @@ static REGISTRY: std::sync::LazyLock<ExtensionRegistry> = std::sync::LazyLock::n
         collections::list::EXTENSION.to_owned(),
         collections::array::EXTENSION.to_owned(),
         collections::static_array::EXTENSION.to_owned(),
+        collections::borrow_array::EXTENSION.to_owned(),
         collections::value_array::EXTENSION.to_owned(),
         qsystem_futures::EXTENSION.to_owned(),
         qsystem_result::EXTENSION.to_owned(),
@@ -160,15 +163,19 @@ fn codegen_extensions() -> CodegenExtsMap<'static, Hugr> {
         .add_logic_extensions()
         .add_extension(SeleneHeapArrayCodegen::LOWERING.codegen_extension())
         .add_default_static_array_extensions()
+        .add_borrow_array_extensions(array::SeleneHeapBorrowArrayCodegen(pcg.clone()))
         .add_extension(FuturesCodegenExtension)
         .add_extension(QSystemCodegenExtension::from(pcg.clone()))
         .add_extension(RandomCodegenExtension)
+        // Results use standard arrays.
         .add_extension(ResultsCodegenExtension::new(
             SeleneHeapArrayCodegen::LOWERING,
         ))
         .add_extension(RotationCodegenExtension::new(pcg))
         .add_extension(UtilsCodegenExtension)
+        // State results use standard arrays.
         .add_extension(DebugCodegenExtension::new(SeleneHeapArrayCodegen::LOWERING))
+        .add_extension(gpu::GpuCodegen)
         .finish()
 }
 
